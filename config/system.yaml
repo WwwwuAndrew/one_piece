@@ -1,0 +1,13 @@
+# 各角色用哪个数据源（名字对应 datasource/fetch.py 的 SOURCE_FACTORIES）
+#   direct  直连东方财富延时行情：只有当天快照
+#   akshare AKShare 取板块历史（数据同样来自东方财富）
+#   tushare tushare 取个股（当天 + 历史）
+board_today: "direct"
+board_history: "akshare"
+stock: "tushare"
+
+# tushare token（必填，否则拉不了个股）。去 https://tushare.pro 注册后复制。
+tushare_token: "aa215f4d32e50515e91cb416e282ed610a1728ab0e3d8765511c1809"
+
+# hunter.py fetch board 批量刷板块时，两个板块之间的间隔秒数（避免被反爬）
+fetch_interval: 2.0
