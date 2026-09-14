@@ -3,7 +3,7 @@
 """
 show_data.py —— 读取本地已存数据，展示成人类可读的列表 / 图形化表格。
 
-只读 data/raw/，不联网。对外：
+只读本地数据库，不联网。对外：
 
     gui(codes, days=15)        把数据渲染成图形化表格，浏览器弹窗打开（hunter show 走这里）
     print_snapshot(rec)        打印单条「今天」快照（板块/个股自动识别）
@@ -11,18 +11,53 @@ show_data.py —— 读取本地已存数据，展示成人类可读的列表 / 
     show_many(codes, days=15)  打印多个代码（板块/个股可混在一起）
 
 一个代码可以是板块（BK1201）或个股（300308）。
+
+★ 单位：**记录里拿到的成交额是「元」**（数据层一律存原始单位），
+  「亿 / 万」是这一层负责换算的（fmt_amount）。展示层不要再假设别的单位。
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from .base import AMOUNT_UNIT, fmt_amount
+from .base import AMOUNT_UNIT, WAN, YI, fmt_amount
 from .fetch import Fetcher, is_board_code
+from .store import date_to_str
 
 # 图形化表格的落点：固定写在项目 data/ 下（不能用 /tmp —— snap 版浏览器读不到 /tmp，
 # 会报 ERR_FILE_NOT_FOUND）。每次 show 都覆盖这一个文件。
 _VIEW_FILE = Path(__file__).resolve().parent.parent / "data" / "view.html"
+
+
+# ---------------------------------------------------------------------------
+# 从记录里取字段
+# ---------------------------------------------------------------------------
+# ⚠️ 两张表的**列名不一样**，展示层必须在这一层统一掉，别散到各处去：
+#      board_daily: concept · price · change_pct · up/down/flat · 板块指标
+#      stock_daily: code    · close · pct_chg    · amount / volume
+#    所以下面这几个小函数就是那座「桥」。展示层**不要直接写 rec.get("price")**——
+#    读错表不会报错，只会静默显示成 "—"（数据没问题、页面是空的，最难发现的一类错）。
+
+def _code(rec: dict) -> str:
+    """记录里的代码：板块表是 concept，个股表是 code。"""
+    return str(rec.get("concept") or rec.get("code") or "")
+
+
+def _day(rec: dict) -> str:
+    """记录里的交易日 -> "YYYY-MM-DD"（库里存的是整数 20260911）。"""
+    return date_to_str(rec.get("trade_date")) or ""
+
+
+def _price(rec: dict):
+    """价格：板块是点位（price），个股是收盘价（close）。"""
+    v = rec.get("price")
+    return rec.get("close") if v is None else v
+
+
+def _chg(rec: dict):
+    """涨跌幅：板块叫 change_pct，个股叫 pct_chg。"""
+    v = rec.get("change_pct")
+    return rec.get("pct_chg") if v is None else v
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +102,7 @@ def _kind_key(code: str) -> str:
 
 def print_snapshot(rec: dict) -> None:
     """打印单条「今天」快照，板块/个股自动识别，逐行展示。"""
-    code = rec.get("code", "")
+    code = _code(rec)
     name = rec.get("name") or "—"
     kind = _kind(code)
     key = _kind_key(code)
@@ -75,7 +110,11 @@ def print_snapshot(rec: dict) -> None:
 
     print(f"\n{line}")
     print(f"  {code}  {name}   [{kind}]")
-    print(f"  行情时间：{rec.get('quote_time', '—')}")
+    # 板块有「行情时间」（东财给的快照时刻）；个股表没有这个字段，就显示交易日
+    if rec.get("quote_time"):
+        print(f"  行情时间：{rec['quote_time']}")
+    else:
+        print(f"  交易日：{_day(rec) or '—'}")
     print(line)
 
     if kind == "板块":
@@ -86,8 +125,8 @@ def print_snapshot(rec: dict) -> None:
         rows = [
             ("名字", name),
             ("今天成交额", fmt_amount(key, rec.get("amount"))),
-            ("今天点位", _num(rec.get("price"))),
-            ("涨跌幅", _pct(rec.get("change_pct"))),
+            ("今天点位", _num(_price(rec))),
+            ("涨跌幅", _pct(_chg(rec))),
             ("涨跌家数", updown),
             ("昨收/开盘", f"{_num(rec.get('pre_close'))} / {_num(rec.get('open'))}"),
             ("最高/最低", f"{_num(rec.get('high'))} / {_num(rec.get('low'))}"),
@@ -99,8 +138,8 @@ def print_snapshot(rec: dict) -> None:
         rows = [
             ("名字", name),
             ("今天成交额", fmt_amount(key, rec.get("amount"))),
-            ("今天价格", _num(rec.get("price"))),
-            ("涨跌幅", _pct(rec.get("change_pct"))),
+            ("今天价格", _num(_price(rec))),
+            ("涨跌幅", _pct(_chg(rec))),
             ("昨收/今开", f"{_num(rec.get('pre_close'))} / {_num(rec.get('open'))}"),
             ("最高/最低", f"{_num(rec.get('high'))} / {_num(rec.get('low'))}"),
             ("成交量", _vol(rec.get("volume"))),
@@ -126,8 +165,8 @@ def _table(records: list[dict]) -> str:
     if not records:
         return "（无数据）"
 
-    kind = _kind(records[0].get("code", ""))
-    key = _kind_key(records[0].get("code", ""))
+    kind = _kind(_code(records[0]))
+    key = _kind_key(_code(records[0]))
     if kind == "板块":
         header = ["日期", "点位", "涨跌幅", "成交额", "涨/跌/平", "换手率", "振幅"]
         rows = []
@@ -135,7 +174,7 @@ def _table(records: list[dict]) -> str:
             up, dn, fl = r.get("up"), r.get("down"), r.get("flat")
             udf = f"{up}/{dn}/{fl}" if up is not None else "—"
             rows.append([
-                r.get("date", ""), _num(r.get("price")), _pct(r.get("change_pct")),
+                _day(r), _num(_price(r)), _pct(_chg(r)),
                 fmt_amount(key, r.get("amount")), udf, _pct0(r.get("turnover_pct")),
                 _pct(r.get("amplitude_pct")),
             ])
@@ -144,11 +183,14 @@ def _table(records: list[dict]) -> str:
         rows = []
         for r in records:
             rows.append([
-                r.get("date", ""), _num(r.get("price")), _pct(r.get("change_pct")),
+                _day(r), _num(_price(r)), _pct(_chg(r)),
                 fmt_amount(key, r.get("amount")), _pct0(r.get("turnover_pct")),
                 _pct(r.get("amplitude_pct")),
             ])
-    return tabulate(rows, headers=header, tablefmt="simple", stralign="right")
+    # disable_numparse：格子里的字符串已经是这一层格式化好的（"12,730.57" / "+1.25%"），
+    # 不让 tabulate 再"聪明地"当成数字重排一遍 —— 否则千分位和小数位会被它吃掉。
+    return tabulate(rows, headers=header, tablefmt="simple", stralign="right",
+                    disable_numparse=True)
 
 
 def show(code: str, days: int = 15) -> None:
@@ -271,12 +313,13 @@ _C_DOWN = "#1a7f45"     # 涨跌幅 负：绿
 def _chart_amount_unit(key: str, amounts: list) -> tuple[str, float]:
     """整张图统一用一个成交额单位，避免同一张图里「万 / 亿」混着标。
 
-    个股存的单位是万：如果最大值够 1 亿，整张图就换算成亿来画；否则用万。
+    传进来的是**元**。板块一律用亿；个股够 1 亿就用亿，否则用万（不然小票的柱子
+    标签会是一串 0）。
     """
     m = max([a for a in amounts if a is not None], default=0) or 0
-    if key == "stock" and m >= 1e4:
-        return "亿", 1e4
-    return AMOUNT_UNIT[key], 1.0
+    if key == "stock" and m < YI:
+        return AMOUNT_UNIT["stock"], WAN        # 万
+    return AMOUNT_UNIT["board"], YI             # 亿
 
 
 def _chart_svg(key: str, records: list[dict]) -> str:
@@ -291,7 +334,7 @@ def _chart_svg(key: str, records: list[dict]) -> str:
 
     n = len(records)
     amounts = [r.get("amount") for r in records]
-    pcts = [r.get("change_pct") for r in records]
+    pcts = [_chg(r) for r in records]
 
     unit, div = _chart_amount_unit(key, amounts)
     amt = [None if a is None else a / div for a in amounts]
@@ -332,7 +375,7 @@ def _chart_svg(key: str, records: list[dict]) -> str:
     for i, r in enumerate(records):
         gx = pad_l + i * group_w
         cx = gx + group_w / 2
-        date = r.get("date", "")
+        date = _day(r)
         tip = f"{date}"
 
         # 左柱：成交额
@@ -390,8 +433,8 @@ def _legend_html(key: str, records: list[dict]) -> str:
 
 def _html_table(records: list[dict]) -> str:
     """一批记录 -> 一张 HTML 表格。板块/个股自动识别。"""
-    kind = "板块" if is_board_code(records[0].get("code", "")) else "个股"
-    key = _kind_key(records[0].get("code", ""))
+    kind = "板块" if is_board_code(_code(records[0])) else "个股"
+    key = _kind_key(_code(records[0]))
     if kind == "板块":
         headers = ["日期", "涨跌幅", "成交额", "涨/跌/平", "点位", "换手率", "振幅"]
         rows = []
@@ -400,11 +443,11 @@ def _html_table(records: list[dict]) -> str:
             udf = f"{up}/{dn}/{fl}" if up is not None else "—"
             rows.append(
                 "<tr>"
-                f"<td>{r.get('date', '')}</td>"
-                f"<td>{_h_chg(r.get('change_pct'))}</td>"
+                f"<td>{_day(r)}</td>"
+                f"<td>{_h_chg(_chg(r))}</td>"
                 f"<td>{_h_amt(key, r.get('amount'))}</td>"
                 f"<td>{udf}</td>"
-                f"<td>{_h_num(r.get('price'))}</td>"
+                f"<td>{_h_num(_price(r))}</td>"
                 f"<td>{_h_pct(r.get('turnover_pct'))}</td>"
                 f"<td>{_h_pct(r.get('amplitude_pct'))}</td>"
                 "</tr>")
@@ -414,10 +457,10 @@ def _html_table(records: list[dict]) -> str:
         for r in records:
             rows.append(
                 "<tr>"
-                f"<td>{r.get('date', '')}</td>"
-                f"<td>{_h_chg(r.get('change_pct'))}</td>"
+                f"<td>{_day(r)}</td>"
+                f"<td>{_h_chg(_chg(r))}</td>"
                 f"<td>{_h_amt(key, r.get('amount'))}</td>"
-                f"<td>{_h_num(r.get('price'))}</td>"
+                f"<td>{_h_num(_price(r))}</td>"
                 f"<td>{_h_pct(r.get('turnover_pct'))}</td>"
                 f"<td>{_h_pct(r.get('amplitude_pct'))}</td>"
                 "</tr>")
@@ -427,12 +470,13 @@ def _html_table(records: list[dict]) -> str:
 
 def _render(codes: list[str], days: int) -> tuple[str, list[str]]:
     """生成整页 HTML，返回 (html, 无数据的代码列表)。"""
+    fetcher = Fetcher()          # 所有标的一次读下来，共用同一个读取器
     tabs: list[tuple[str, str, str]] = []
     missing: list[str] = []
     for raw in codes:
         code = str(raw).strip().upper()
         try:
-            records = Fetcher().history(code, days=days)
+            records = fetcher.history(code, days=days)
         except Exception as exc:
             missing.append(f"{code}（{exc}）")
             continue

@@ -1,7 +1,215 @@
 # one_piece
-猎人系统，希望能够通过板块势能找寻到资金留下的脚印，并分别资金留下的脚印从而追寻资金的方向
 
-# 整体架构
+猎人系统 —— 通过**板块势能**找寻资金留下的脚印，顺着脚印判断资金的方向。
+
+> 模型本身写在 [`doc/model.md`](doc/model.md)：四因子（Flow / Breadth / Efficiency /
+> Crowding）、五个阶段、三层判断。这份 README 只讲**怎么用**。
+
+---
+
+## 快速开始
+
+```bash
+# 1. 装依赖（建议用虚拟环境）
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+# 2. 填 tushare token（去 https://tushare.pro 注册后复制）
+#    config/system.yaml 里的 tushare_token
+
+# 3. 第一次用：补一段历史 + 建个股字典（都是一次性的）
+python3 hunter.py backfill market --days 30    # 最近 30 个交易日全市场日线（≈31 个请求）
+python3 hunter.py update stock                 # 全市场个股名字（1 个请求）
+
+# 4. 之后每天收盘后只要这一条
+python3 hunter.py fetch market
+```
+
+## 用法（`hunter.py` 是唯一的执行入口）
+
+```
+python3 hunter.py <动作> <内容> [选项]
+```
+
+| 动作 | 命令 | 做什么 | 联网 |
+| --- | --- | --- | :-: |
+| **fetch** | `fetch market` | 拉全市场**一天**的日线入库 | ✅ 1 个请求 |
+| | `fetch market --date 20260911` | 指定交易日 | ✅ |
+| | `fetch BK1201` | 板块当天快照（东财） | ✅ |
+| | `fetch BK1201 --days 15` | 板块最近 15 个交易日 | ✅ |
+| | `fetch 300308` | 个股最新一天 / `--days 15` 最近 15 天 | ✅ |
+| | `fetch board` | 把本地已有数据的板块**全部**刷一遍最新 | ✅ 已有当天的**跳过** |
+| | `fetch watch` | 只刷**自选**里的标的 / `--days 15` 拉最近 15 天 | ✅ 已有当天的**跳过** |
+| | `fetch board --force` | 本地已是最新的也重拉 | ✅ |
+| **backfill** | `backfill market --days 30` | 补历史空档（按交易日逐天往前拉） | ✅ 每天 1 个请求 |
+| | `backfill market --days 30 --force` | 已有的也重拉（修「那天没取全」） | ✅ |
+| **update** | `update member BK1201` | 同步一个板块的成分股名单 | ✅ 分页拉 |
+| | `update member all` | 库里**所有**板块的成分股（带防反爬 + 可续跑） | ✅ |
+| | `update member watch` | 只同步**自选里那些板块**的成分股 | ✅ |
+| | `update stock` | 个股字典（代码 → 名字），1 个请求拿全市场 | ✅ |
+| **watch** | `watch BK1201 300308` | 加入自选（板块 / 个股都行） | ❌ 只改本地状态 |
+| | `watch` | 看当前自选（带「本地有没有数据」） | ❌ |
+| | `unwatch BK1201` | 移出自选 | ❌ |
+| **show** | `show BK1201` | 图形化展示（柱状图 + 明细表，浏览器打开） | ❌ 只读本地 |
+| | `show 300308 --days 30` | 个股最近 30 个交易日 | ❌ |
+| | `show board` | 本地所有板块，一个板块一个标签页 | ❌ |
+| | `show watch` | 只看自选里的标的（板块/个股混着也行） | ❌ |
+
+`show` 只读本地数据库，**不联网**；页面落在 `data/view.html`，可以反复看。
+每个标的一屏：上面是「成交额 + 涨跌幅」分组柱状图（左柱 = 成交额、右柱 = 涨跌幅），
+下面是明细表。
+
+### 三个动作的区别
+
+| | 什么时候用 | 请求量 |
+| --- | --- | --- |
+| `fetch market` | **每天收盘后**（日常） | 1 |
+| `backfill market` | 第一次用 / 想回看更早的行情（一次性） | 天数 |
+| `update ...` | 「定义类」数据变了才用（上市、改名、换成分股） | 见上 |
+
+> **行情只拉一次**：所有板块指标都在本地从「全市场日线 + 板块成员」算出来，
+> 不会逐个板块去拉股票 —— 那才是会触发反爬的操作。
+
+## 自选（只看我关心的那几个）
+
+不可能盯住所有板块，所以看到感兴趣的**加进来**，势能走完再**移出去**：
+
+```bash
+python3 hunter.py watch BK1201 300308     # 加入自选（板块、个股都能加）
+python3 hunter.py watch                   # 看当前自选
+python3 hunter.py unwatch BK1201          # 移出自选（势能结束了）
+```
+
+自选加好之后，`fetch` / `update` / `show` 都认一个关键字 **`watch`** —— 只对自选里的标的做同一件事：
+
+```bash
+python3 hunter.py fetch watch             # 刷自选的最新行情（自选有几个就几个请求）
+python3 hunter.py fetch watch --days 15   # 拉自选的最近 15 个交易日
+python3 hunter.py show watch              # 只看自选（板块和个股混在一个页面里）
+python3 hunter.py update member watch     # 只同步自选里板块的成分股
+```
+
+`watch` / `unwatch` 只改本地状态，**一个请求都不发**；要拉数据永远是另一条命令 ——
+**联网动作都由你显式触发**。
+
+自选存在 `data/local.sqlite`（**不可重建**，所以单独一个文件，方便单独备份）。
+移出自选时**行会保留**（只标记为「已移除」），名字、加入时间都还在，
+以后想再加回来还是原来那条记录。
+
+`python3 hunter.py watch` 会顺手告诉你每个自选**本地有没有数据**，省得你去猜为什么 `show` 是空的：
+
+```
+自选 2 个（板块 1 / 个股 1）
+
+  [板块]
+    BK1201  电子        2026-09-13 起   1 个交易日
+  [个股]
+    300308  中际旭创     2026-09-14 起   ⚠️ 本地还没有数据
+```
+
+## 数据放在哪
+
+```
+data/
+├── raw/raw.sqlite        ★ 原始数据（全都能重新下载，删了不可惜）
+│   ├── stock_daily       全市场个股日线（一天约 5500 行）  amount=元  volume=股
+│   ├── stock_list        个股字典（代码 → 名字）
+│   ├── board_daily       东财板块日线
+│   ├── board_list        板块字典（代码 → 名称 + 成员同步时间）
+│   └── concept_member    板块 → 成员（**快照**，没有日期列）
+├── local.sqlite          ★ 本地状态（**不可重建**，删了就真没了）
+│   └── watchlist         自选（板块 + 个股）
+└── view.html             `show` 生成的页面（每次覆盖）
+```
+
+**为什么分两个库**：判据不是体积，是**能不能重建**。
+`raw/` 里的东西删了重新下载就行；`local.sqlite` 里的自选既下不到也算不出，
+所以单独一个文件，方便单独备份。跨库不需要 JOIN（自选读出来就是个 Python 列表）。
+
+**为什么名字单独一张表**：名字很少变、行情天天变。混在一起的话，
+每天几千行都要重复存一遍同样的名字，改个名字还得改全部历史。
+
+**单位约定**：库里一律存**原始单位**（金额 = 元、成交量 = 股），方便程序直接算；
+换算成「亿 / 万」只发生在**展示**那一步。
+
+## 防反爬
+
+| 手段 | 在哪 |
+| --- | --- |
+| **本地已有的不重复拉，连请求都不发**（判据见下） | `fetch board` / `fetch watch` |
+| 行情**只**从 Tushare 按交易日整批拉，绝不逐个板块翻成分股 | `fetch market` |
+| 东财只做「板块字典」（哪些股票属于这个板块），用完不碰 | `update member` |
+| 请求之间强制间隔（`config/system.yaml` 的 `fetch_interval`，默认 2 秒） | `fetch board` / `update member all` / `backfill` |
+| **本地已有的不重复拉** —— 中断后重跑接着补，不白费请求 | 所有命令 |
+| 今天已同步过的板块跳过（`--force` 可覆盖） | `update member all` |
+| 一旦被拒（`RemoteDisconnected`）**立刻停下**，不再继续敲 | `update member all` |
+
+## 「已经是最新的」是怎么判断的
+
+`fetch board` / `fetch watch` 会先看一眼**本地**，已经是最新的就**跳过、一个请求都不发**：
+
+```
+本地已有的板块 21 个，只要最新
+  本地已是最新（交易日钟 = 2026-09-14）跳过 21 个：
+      BK0433, BK0436, BK0437, ...
+      要强制重拉：加 --force
+  ✅ 本地已有的板块 全都已经是最新的了，一个请求都不用发
+```
+
+判据不是「今天几号、今天开不开市」，而是：
+
+> **交易日钟 = `stock_daily` 里最大的交易日**，也就是全市场日线覆盖到的最后一天。
+
+每天跑一次 `fetch market` 之后，这个钟就走到当天了；任何标的只要本地最后一天 ≥ 这个钟，
+就说明它已经是最新的。这样做的好处是**永远不用判断「今天是哪天、今天是不是交易日」**——
+那种判断在周末和节假日一定会算错，而「全市场日线到哪天了」是既成事实。
+
+| 情况 | 行为 |
+| --- | --- |
+| 跑过 `fetch market`（当天数据已入库） | 有当天数据的标的全部跳过，0 个请求 |
+| 周末 / 节假日 | 钟停在最后一个交易日 -> 停在那天的标的跳过，不浪费请求 |
+| 库里还没有全市场日线 | 无从判断 -> **老实去拉**（不瞎跳过） |
+| 给了 `--days N` | 你要的是历史，那就**不跳过**，老老实实拉 |
+| 想强制刷新 | 加 `--force` |
+
+## 配置（`config/system.yaml`）
+
+```yaml
+board_today:   "direct"    # 板块当天快照用哪个数据源
+board_history: "akshare"   # 板块历史用哪个
+stock:         "tushare"   # 个股
+# market:      "tushare"   # 全市场日线（不填则复用 stock）
+tushare_token: "..."       # 必填，否则拉不了个股
+fetch_interval: 2.0        # 两次联网请求之间的间隔秒数
+```
+
+可选数据源：`direct`（东财延时行情，只有当天）· `akshare`（板块历史）·
+`tushare`（个股 + 全市场）。
+
+## 目录结构
+
+```
+├── hunter.py                  ★ 唯一执行入口（命令行）
+├── config/
+│   ├── config.py              读 yaml 的 Config 单例
+│   └── system.yaml            数据源 / token / 间隔
+├── datasource/
+│   ├── fetch.py               数据获取主接口：选源 + 拉取 + 查重 + 入库
+│   ├── store.py               数据库存取层（两个库、五张表 + 自选）
+│   ├── base.py                数据源基类 + 方法契约 + 工具函数
+│   ├── fetch_direct.py        东财直连（板块快照 / 成分股）
+│   ├── fetch_akshare.py       AKShare（板块历史）
+│   ├── fetch_tushare.py       Tushare（全市场日线 / 个股 / 个股字典）
+│   ├── boards.py              板块封装接口（Boards）
+│   ├── stock.py               个股封装接口（Stocks）
+│   └── show_data.py           展示层（图形化页面 / 控制台表格）
+├── doc/model.md               ★ 模型本身（四因子 / 五阶段 / 判断闭环）
+├── data/                      数据（见上）
+└── test.py                    排障小工具（探接口、对数）
+```
+
+## 架构
+
+```
                     ┌─────────────┐
                     │    Data     │
                     └──────┬──────┘
@@ -34,73 +242,16 @@
                  ┌────────────────┐
                  │ Decision Engine│
                  └───────┬────────┘
-                         ↓
+                          ↓
                ┌───────────────────┐
                │ Visualization     │
                │                   │
                │ 板块势能地图        │
                └───────────────────┘
+```
 
-# 目录结构
+**当前进度**：采集层（Data）已完成 —— 原始数据五张表齐全、可重建、可增量补。
+下一步是 Feature / Signal 层（个股状态向量 → 板块四因子 → 阶段判断）。
 
-├── README.md
-├── config/
-│   ├── system.yaml
-│   ├── data.yaml
-│   └── strategy.yaml
-│
-├── data/
-│   ├── raw/                    # 原始数据
-│   ├── processed/              # 清洗后的数据
-│   ├── features/               # 计算后的指标
-│   └── snapshots/              # 每日/每次运行的结果快照
-│
-├── datasource/
-│   ├── sector.py               # 板块数据获取
-│   ├── stock.py                # 成分股数据获取
-│   ├── market.py               # 大盘数据获取
-│   └── provider.py             # 数据源统一接口
-│
-│
-├── indicators/
-│   ├── flow.py                 # Flow 指标
-│   ├── breadth.py              # Breadth 指标
-│   ├── efficiency.py           # Efficiency 指标
-│   ├── crowding.py             # Crowding 指标
-│   └── common.py               # 通用技术指标
-│
-├── strategy/
-│   ├── base.py                 # 策略基类
-│   ├── phase.py                # 五阶段判断
-│   ├── flow_strategy.py
-│   ├── breadth_strategy.py
-│   ├── efficiency_strategy.py
-│   ├── crowding_strategy.py
-│   └── custom/                 # 个人盘感策略
-│
-├── scoring/
-│   ├── flow_score.py
-│   ├── breadth_score.py
-│   ├── efficiency_score.py
-│   ├── crowding_score.py
-│   ├── energy_score.py
-│   └── phase_score.py
-│
-├── decision/
-│   ├── phase_classifier.py     # 当前阶段
-│   ├── transition.py           # 阶段移动方向
-│   └── confidence.py           # 判断置信度
-│
-├── visualization/              # 图形化展示
-│
-├── application/
-│   ├── analyze_sector.py       # 分析一个板块
-│   ├── analyze_batch.py        # 分析多个板块
-│   └── daily_run.py            # 每日运行
-│
-└── tests/
-    ├── datasource/
-    ├── indicators/
-    ├── strategy/
-    ├── scoring/
-    └── decision/
+> 规划中的模块（`indicators/` `strategy/` `scoring/` `decision/` `visualization/`）
+> 会随着模型实现逐步加进来，见 `doc/model.md` 第十章。

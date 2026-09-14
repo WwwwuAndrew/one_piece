@@ -24,7 +24,7 @@ akshare 只有板块、tushare 只有个股），基类给每个方法一个「�
 ======================================================================
 
 1. **统一返回 `list[dict]`**
-   当天通常 1 条，历史多天多条。统一成列表，Fetcher 才能无差别地合并落盘。
+   当天通常 1 条，历史多天多条。统一成列表，Fetcher 才能无差别地比对入库。
 
 2. **`days` 的含义**
    `days=None` -> 只要最新的那一条（当天快照）
@@ -33,27 +33,41 @@ akshare 只有板块、tushare 只有个股），基类给每个方法一个「�
 3. **金额 / 成交量一律给「原始单位」**
    金额 = **元**，成交量 = **股**。
    （tushare 的「千元」「手」要在数据源里先换算成 元 / 股。）
-   换算成「落盘单位」由 `format_record()` 统一做，数据源不要自己换算 —— 
-   这样以后换数据源，落盘格式也不会变。
+   入库时**原样存**，不做任何缩放 —— 这样以后换数据源，库里也不会多出一层换算错。
 
-4. **字段可以少给**（拿不到的就不给），`format_record()` 会把缺的补成 `None`：
-   **属性一定在，只是没值**。落盘格式由本文件的 BOARD_FIELDS / STOCK_FIELDS 唯一决定。
+4. ★ **字段名一律用这一套「对外名」**（板块 / 个股都一样，别各叫各的）：
 
-5. **拿不到的能力要明确报错**，绝不能静默少返回数据。
+       日期 date · 代码 code · 名字 name
+       价格 price · 涨跌幅 change_pct · 涨跌额 change
+       开 open · 高 high · 低 low · 昨收 pre_close · 量 volume · 额 amount(元)
+
+   为什么必须统一：**两张表的列名并不一样**
+   （板块是 `price` / `change_pct`，个股是 `close` / `pct_chg` —— 后者是 tushare 的叫法）。
+   数据源只管按上面这套名字给，翻成各表的列名是 `Fetcher._to_row` **一个地方**的事。
+   ⚠️ 那里漏翻一个字段不会报错，只会让那一列静默变成 NULL（价格、涨跌幅全空）。
+
+5. **字段可以少给**（拿不到的就不给），写库时缺的自动是 NULL：
+   **列一定在，只是没值**。列的集合由数据库的建表语句（store.py）唯一决定，
+   不再由代码里的一份字段清单维护 —— 表结构就是契约，改了表就一定会被发现。
+
+6. **拿不到的能力要明确报错**，绝不能静默少返回数据。
 
 ======================================================================
-本地统一落盘格式
+数据层：数据库是唯一的落盘格式
 ======================================================================
 
-不管数据来自 direct / akshare / tushare，落盘前都要过一遍 `format_record()`：
+`data/raw/raw.sqlite` 里的表就是唯一真相（早期用过 jsonl，已彻底退役）：
 
-    · 字段固定、顺序固定  -> 同类记录（board 之间 / stock 之间）长得完全一样；
-    · 缺的字段补 None      -> 「拉不到涨跌家数」也照样有这个属性，只是值为 None；
-    · 多余的字段丢掉；
-    · 成交额换算成落盘单位并保留 1 位小数：
-        board -> 亿
-        stock -> 万（展示时如果够 1 亿会自动显示成亿）
-    · board 和 stock 的格式**可以不一样**（板块有涨跌家数、个股有上市日期）。
+    stock_daily    (code, trade_date, open, high, low, close, pre_close,
+                    change, pct_chg, volume, amount)          amount=元 volume=股
+    board_daily    (concept, trade_date, source, price, change_pct, ...)
+    board_list     (concept, name, member_updated_at)
+    concept_member (concept, code)
+
+所以：
+  · 「同类记录长得一样」由**表结构**保证，不需要代码再拼一份固定字段；
+  · 内存里的记录 = 数据库的一行（列名、单位全都跟库里一致）；
+  · 换算成「亿 / 万」只发生在展示那一步（fmt_amount / show_data）。
 """
 
 from __future__ import annotations
@@ -71,6 +85,9 @@ BEIJING = timezone(timedelta(hours=8))
 class DataSource:
     """数据源基类。子类覆盖自己支持的方法，不支持的直接抛 NotImplementedError。"""
 
+    # ⚠️ 这是**数据源自己的名字**（写进记录的 source 字段），不是「标的的名字」。
+    #    子类必须显式声明；实例里也不要再写 self.name = ...（会把数据源名字顶掉）。
+    #    （忘了声明就会继承成 "base"，那是最难查的一类错：数据看着都对，来源是假的。）
     name = "base"
 
     def fetch_board(self, code: str, days: int | None = None) -> list[dict]:
@@ -160,6 +177,15 @@ def to_date(value) -> str | None:
     return None
 
 
+def today_str() -> str:
+    """今天的 "YYYY-MM-DD"（北京时区）。
+
+    只用来当**查询参数**（该去问哪一天），不参与交易日的判断 ——
+    哪天真有数据，永远由接口返回的内容决定。
+    """
+    return datetime.now(BEIJING).strftime("%Y-%m-%d")
+
+
 def date_window(days: int) -> tuple[str, str]:
     """N 个交易日大约对应 N*1.7 个自然日，再加点缓冲。
 
@@ -174,82 +200,28 @@ def date_window(days: int) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# 本地统一落盘格式（schema）
+# 金额的「展示单位」
 # ---------------------------------------------------------------------------
-# 字段顺序 = 落盘 jsonl 里每行的字段顺序。同类记录必须完全一致：
-#   · 属性一定在（拿不到就是 None），不再把 None 丢掉；
-#   · 顺序固定，方便肉眼比对和 diff。
+# ⚠️ 数据层（数据库）一律存**原始单位：元**。这两个只是「显示成什么单位好看」：
+#    板块成交额动辄几千亿 -> 用亿
+#    个股成交额可能只有几千万 -> 用万（够 1 亿时自动换成亿）
+#
+# 换算只该发生在**展示**那一步（fmt_amount / show_data），绝不要在读写路径上做。
 
-BOARD_FIELDS = (
-    "date", "code", "name", "source",
-    "price", "change_pct", "change",
-    "amount", "volume",
-    "up", "down", "flat",                       # 板块独有：涨跌家数
-    "open", "high", "low", "pre_close",
-    "amplitude_pct", "turnover_pct",
-    "total_mv", "float_mv",
-    "pe", "volume_ratio", "pb", "chg_60d", "chg_ytd",
-    "quote_time",
-)
-
-STOCK_FIELDS = (
-    "date", "code", "name", "source",
-    "price", "change_pct", "change",
-    "amount", "volume",
-    "open", "high", "low", "pre_close",
-    "amplitude_pct", "turnover_pct",
-    "total_mv", "float_mv",
-    "pe", "volume_ratio", "pb", "chg_60d", "chg_ytd",
-    "list_date",                                # 个股独有：上市日期
-    "quote_time",
-)
-
-FIELDS = {"board": BOARD_FIELDS, "stock": STOCK_FIELDS}
-
-# 成交额的「落盘单位」：板块存亿，个股存万（个股金额小，存亿会丢精度）
-AMOUNT_UNIT = {"board": "亿", "stock": "万"}
-_AMOUNT_DIVISOR = {"board": 1e8, "stock": 1e4}
+AMOUNT_UNIT = {"board": "亿", "stock": "万"}    # 各自「默认」显示成什么单位
+YI = 1e8                                        # 亿
+WAN = 1e4                                       # 万
 
 
-def store_amount(kind: str, yuan) -> float | None:
-    """成交额：元 -> 落盘单位（board 亿 / stock 万），保留 1 位小数。"""
+def fmt_amount(kind: str, yuan) -> str:
+    """元 -> 给人看的字符串。
+
+    板块：4,886.2 亿
+    个股：够 1 亿就显示 亿（99.8 亿），不够就显示 万（1,234.5 万）
+    """
     v = to_num(yuan)
     if v is None:
-        return None
-    return round(v / _AMOUNT_DIVISOR[kind], 1)
-
-
-def fmt_amount(kind: str, stored) -> str:
-    """把落盘的成交额显示成人看的样子。
-
-    板块：4886.2 亿
-    个股：存的单位是万；够 1 亿就换成亿显示（299740.0 万 -> 299.7 亿），否则 1234.5 万。
-    """
-    v = to_num(stored)
-    if v is None:
         return "—"
-    if kind == "stock" and abs(v) >= 1e4:
-        return f"{v / 1e4:,.1f} 亿"
-    return f"{v:,.1f} {AMOUNT_UNIT[kind]}"
-
-
-def format_record(kind: str, rec: dict, source: str | None = None,
-                  already_formatted: bool = False) -> dict:
-    """把任意数据源给的记录，格式化成该 kind 的本地统一格式。
-
-    kind              : 'board' | 'stock'
-    source            : 数据源名字，写进 source 字段（None 则保留原值）
-    already_formatted : True 表示 rec 已经是本地格式（成交额已是 亿/万），
-                        **不再做单位换算**。迁移旧数据时用它避免重复换算。
-    """
-    fields = FIELDS[kind]
-    out = {f: rec.get(f) for f in fields}
-
-    if source is not None:
-        out["source"] = source
-
-    if not already_formatted:
-        raw = to_num(rec.get("amount"))
-        out["amount"] = None if raw is None else store_amount(kind, raw)
-
-    return out
+    if kind == "stock" and abs(v) < YI:
+        return f"{v / WAN:,.1f} 万"
+    return f"{v / YI:,.1f} 亿"

@@ -28,7 +28,7 @@ class Stocks:
         self.fetcher = fetcher or Fetcher()
 
     def fetch(self, code: str, days: int | None = None) -> FetchResult:
-        """联网拉取个股数据并落盘。
+        """联网拉取个股数据并入库（数据源 / 存储位置都由 fetch.py 决定）。
 
         days=None -> 只要最新一条；days=N -> 最近 N 个交易日。
         """

@@ -28,7 +28,7 @@ class Boards:
         self.fetcher = fetcher or Fetcher()
 
     def fetch(self, code: str, days: int | None = None) -> FetchResult:
-        """联网拉取板块数据并落盘。
+        """联网拉取板块数据并入库（数据源 / 存储位置都由 fetch.py 决定）。
 
         days=None -> 当天快照；days=N -> 最近 N 个交易日（会自动换到历史数据源）。
         """

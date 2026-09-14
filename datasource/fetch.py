@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fetch.py —— 数据获取主接口：按配置选数据源 + 联网拉取 + 按交易日落盘。
+fetch.py —— 数据获取主接口：按配置选数据源 + 联网拉取 + 按交易日入库。
 
     from datasource.fetch import Fetcher
     f = Fetcher()
@@ -11,44 +11,53 @@ fetch.py —— 数据获取主接口：按配置选数据源 + 联网拉取 + �
     f.fetch("300308", days=15)    -> FetchResult  个股最近 15 个交易日
     f.history("BK1201", days=15)  -> list[dict]   读本地（不联网）
     f.load("BK1201")              -> list[dict]   读本地全部
-    f.cached_codes("board")       -> list[str]    本地已缓存了哪些板块
+    f.cached_codes("board")       -> list[str]    本地已有哪些板块
+
+    # 全市场（走数据库，一天 1 个请求）
+    f.market()                    -> MarketDay    拉最近有数据的一天
+    f.market("20260911")          -> MarketDay    拉指定交易日（本地已有则跳过）
+    f.market("20260911", force=True) -> MarketDay 重拉这天（先删后写）
+    f.market_plan(30)             -> list[dict]   最近 30 个交易日的补数计划（谁有谁没有）
 
 数据源路由（在 config/system.yaml 里配）：
     board_today    板块「当天」用哪个数据源   （默认 direct）
     board_history  板块「历史」用哪个数据源   （默认 akshare，数据同样来自东财）
     stock          个股（当天 + 历史）        （默认 tushare）
+    market         全市场日线                 （不配则复用 stock）
     可选名字见下面的 SOURCE_FACTORIES：direct / akshare / tushare
 
 fetch 的流程：
     1. 按上面的配置挑一个数据源；
     2. 联网拉取（days=None 只要最新一条，days=N 要最近 N 个交易日）；
-    3. 拿回来的每条记录按交易日与本地比对；
-    4. 本地没有的才追加落盘（同一交易日不覆盖）。
+    3. 数据源给的原值（金额=元、成交量=股）**原样**对齐成数据库的列；
+    4. 拿回来的每条记录按交易日与本地比对，本地没有的才写进去（同一交易日不覆盖）。
 
 存什么永远由数据源返回的交易日决定，**不做任何「今天是哪天」的判断**，
 所以周末、法定节假日都不会算错。
 
-落盘格式：
-    data/raw/board/BK1201.jsonl   板块，每个代码一个文件
-    data/raw/stock/300308.jsonl   个股，每个代码一个文件
-    一行 = 一个交易日的一条快照（JSON），追加式；读单只标的只读它那一个文件。
+板块和个股都直接进数据库（`data/raw/raw.sqlite`）。
+  内存里的记录 = 「数据库的一行」（列名 / 单位都跟库里一致），
+  所以调用方（boards / stock / show_data）完全不必知道数据存在哪儿。
 """
 
 from __future__ import annotations
 
-import json
-import os
 from dataclasses import dataclass, field
-from pathlib import Path
+from datetime import datetime, timedelta
 
 from config.config import config
 
-from .base import DataSource, FIELDS, format_record, is_board_code, is_stock_code
+from .base import DataSource, is_board_code, is_stock_code, to_date, today_str
 from .fetch_akshare import AkshareSource
 from .fetch_direct import DirectSource
 from .fetch_tushare import TushareSource
+from .store import Store, date_to_int, date_to_str, store as default_store
 
-DEFAULT_RAW_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
+# 两个 kind 各自的表列定义。列取自数据库，所以「表加了列」不会被漏掉。
+_TABLE_COLS: dict[str, tuple] = {
+    "board": Store.TABLE_COLS["board_daily"],
+    "stock": Store.TABLE_COLS["stock_daily"],
+}
 
 # 数据源工厂：名字 -> 造实例的可调用对象。
 #
@@ -68,12 +77,48 @@ class FetchResult:
 
     code: str
     fetched: list[dict] = field(default_factory=list)  # 这次从数据源拿到的
-    added: list[dict] = field(default_factory=list)    # 其中本地原本没有、已落盘的
-    total: int = 0                                     # 落盘后本地总条数
+    added: list[dict] = field(default_factory=list)    # 其中本地原本没有、已入库的
+    total: int = 0                                     # 入库后本地总条数
 
     def __repr__(self) -> str:
         return (f"<FetchResult {self.code} 拉到 {len(self.fetched)} 条，"
                 f"新增 {len(self.added)} 条，本地共 {self.total} 条>")
+
+
+@dataclass
+class MarketDay:
+    """全市场「某一个交易日」的拉取结果。
+
+    skipped=True 表示本地已经有这天，**一个请求都没发**（缓存优先）。
+    empty（fetched=0 且没跳过）表示联网问了，但那天没数据 ——
+    非交易日、或数据还没发布，都不是错误。
+    """
+
+    day: str | None = None      # 对应的交易日 "YYYY-MM-DD"
+    fetched: int = 0            # 数据源这次返回的行数
+    added: int = 0              # 新增入库的行数
+    total: int = 0              # 这一交易日在库里的总行数
+    skipped: bool = False       # 本地已有，没联网
+
+    @property
+    def empty(self) -> bool:
+        return not self.skipped and self.fetched == 0
+
+    def __repr__(self) -> str:
+        if self.skipped:
+            return f"<MarketDay {self.day} 本地已有 {self.total} 行，跳过>"
+        if self.empty:
+            return f"<MarketDay {self.day} 没有数据>"
+        return f"<MarketDay {self.day} 拉到 {self.fetched} 行，新增 {self.added} 行>"
+
+
+def _day_span(end_day: str, back: int) -> list[str]:
+    """从 end_day 往回 back 个自然日，**新的在前**（"YYYY-MM-DD"）。
+
+    注意这只是「候选日期」，不判断哪天是交易日 —— 交易日由交易日历 / 接口返回决定。
+    """
+    end = datetime.strptime(end_day, "%Y-%m-%d").date()
+    return [(end - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(back + 1)]
 
 
 # ---------------------------------------------------------------------------
@@ -81,16 +126,16 @@ class FetchResult:
 # ---------------------------------------------------------------------------
 
 class Fetcher:
-    """按配置挑数据源，把「拉取 -> 比对交易日 -> 落盘」编排起来。
+    """按配置挑数据源，把「拉取 -> 比对交易日 -> 入库」编排起来。
 
     sources : 名字 -> 数据源实例，用来覆盖默认工厂（测试、临时换源用）
-    raw_dir : 落盘根目录，默认 data/raw，测试时可以指向临时目录
+    db      : 数据落到哪个库，默认 data/raw/raw.sqlite（测试时可指向临时库）
     """
 
     def __init__(self,
                  sources: dict[str, DataSource] | None = None,
-                 raw_dir: str | Path | None = None):
-        self.raw_dir = Path(raw_dir) if raw_dir is not None else DEFAULT_RAW_DIR
+                 db=None):
+        self.db = db if db is not None else default_store
         self._injected = dict(sources or {})
         self._cache: dict[str, DataSource] = {}
 
@@ -121,94 +166,122 @@ class Fetcher:
             raise ValueError(f"config/system.yaml 里没配置 {key}（这个角色该用哪个数据源）")
         return self._source(name)
 
-    # -- 本地读写 ---------------------------------------------------------
-    def _sub_dir(self, kind: str) -> Path:
-        return self.raw_dir / ("board" if kind == "board" else "stock")
+    # -- 本地读写（全部走数据库）------------------------------------------
 
-    def _path(self, code: str) -> Path:
-        """代码 -> 本地文件路径（含目录）。无法识别时抛错。"""
-        code = str(code).strip().upper()
+    @staticmethod
+    def _kind_of(code: str) -> str:
+        """代码 -> 'board' | 'stock'（无法识别时抛错）。"""
         if is_board_code(code):
-            return self._sub_dir("board") / f"{code}.jsonl"
+            return "board"
         if is_stock_code(code):
-            return self._sub_dir("stock") / f"{code}.jsonl"
+            return "stock"
         raise ValueError(f"无法识别的代码：{code}（板块形如 BK1201，个股形如 300308）")
 
     def cached_codes(self, kind: str) -> list[str]:
-        """本地已经缓存了哪些代码（看有哪些 jsonl 文件）。kind: 'board' | 'stock'。"""
+        """本地已经有哪些代码。kind: 'board' | 'stock'。
+
+        板块 = board_daily 里出现过的；个股 = stock_daily 里出现过的。
+        （个股是全市场入库的，所以这里通常会返回几千个 —— 这是对的。）
+        """
         if kind not in ("board", "stock"):
             raise ValueError(f"kind 只能是 'board' 或 'stock'，收到：{kind!r}")
-        d = self._sub_dir(kind)
-        if not d.exists():
-            return []
-        return sorted(p.stem for p in d.glob("*.jsonl"))
+        table, col = (("board_daily", "concept") if kind == "board"
+                      else ("stock_daily", "code"))
+        return [r[col] for r in self.db.query(
+            f"SELECT DISTINCT {col} FROM {table} ORDER BY {col}")]
 
     def load(self, code: str) -> list[dict]:
-        """读本地文件全部记录（按日期升序）。文件不存在返回空列表。"""
-        path = self._path(code)
-        if not path.exists():
-            return []
-        records = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            records.append(json.loads(line))
-        records.sort(key=lambda r: r.get("date", ""))
-        return records
+        """读本地记录（升序）。
+
+        记录 = 数据库的一行 + `name`：名字属于「字典」不属于行情，
+        所以它不在行情表里，要从 board_list / stock_list 补上。
+        """
+        code = str(code).strip().upper()
+        kind = self._kind_of(code)
+        if kind == "board":
+            rows = self.db.load_board_daily(code)
+        else:
+            code = code.zfill(6)
+            rows = self.db.load_stock_daily(codes=[code])
+        name = self.dict_name(kind, code)
+        for r in rows:
+            r["name"] = name
+        return rows
 
     def history(self, code: str, days: int | None = None) -> list[dict]:
         """本地已存的记录（升序）；days 非空则只取最近 N 个交易日。"""
-        records = self.load(code)
-        if days:
-            records = records[-days:]
-        return records
+        rows = self.load(code)
+        return rows[-days:] if days else rows
 
-    def _save(self, code: str, records: list[dict]) -> None:
-        """以交易日为准去重（同一交易日保留最先出现的一条、不覆盖），升序写回 jsonl。
+    def dict_name(self, kind: str, code: str) -> str | None:
+        """从字典表取名字（板块 board_list / 个股 stock_list）。
 
-        写入时先写临时文件再原子替换，避免中途崩溃损坏原文件。
+        公开的：加自选、报告里都要靠它把「代码」显示成「代码 + 名字」。
         """
-        path = self._path(code)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        return self.db.name_of(kind, code)
 
-        dedup: dict[str, dict] = {}
-        for r in records:
-            d = r.get("date")
-            if d and d not in dedup:
-                dedup[d] = r  # 同一交易日首次出现才保留，不覆盖
-        ordered = [dedup[d] for d in sorted(dedup)]
+    def _save(self, code: str, rows: list[dict]) -> None:
+        """入库。**同一交易日已存在的不覆盖**（这就是「以交易日为准」的落点）。
 
-        tmp = path.with_suffix(".jsonl.tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            for r in ordered:
-                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
-        os.replace(tmp, path)
+        顺手把名字写进字典表（数据源带了名字就带上，比单独再查一次省一个请求）。
+        """
+        if is_board_code(code):
+            self.db.save_board_daily(rows)
+            names = [{"concept": code, "name": r.get("name")} for r in rows if r.get("name")]
+            if names:
+                self.db.upsert_board_list(names)
+            return
 
-    @staticmethod
-    def _fill_name(records: list[dict], local: list[dict]) -> None:
-        """数据源没给名字时，从本地已有记录里补上（就地改 records）。
+        self.db.save_stock_daily(rows)
+        names = [{"code": r["code"], "name": r.get("name")} for r in rows if r.get("name")]
+        if names:
+            self.db.upsert_stock_list(names)
+
+    def _fill_name(self, kind: str, code: str, rows: list[dict], local: list[dict]) -> None:
+        """数据源没给名字时，从本地已有记录 / 字典表里补上（就地改 rows）。
 
         最典型的是 akshare 的板块历史：那个接口根本不返回板块名称。
         补不到就算了，不报错、也不编造。
         """
-        name = next((r.get("name") for r in reversed(local) if r.get("name")), None)
+        name = (next((r.get("name") for r in reversed(local) if r.get("name")), None)
+                or self.dict_name(kind, code))
         if not name:
             return
-        for r in records:
+        for r in rows:
             if not r.get("name"):
                 r["name"] = name
 
+    # -- 本地是不是最新的（0 个请求就能判断）-------------------------------
+    def is_up_to_date(self, code: str, ref_day: int | None = None) -> bool:
+        """本地已经有「最新交易日」的数据了吗？—— **不用联网**。
+
+        判据：这个标的本地最后一天 >= 全市场日线覆盖到的最后一天（交易日钟）。
+        为什么这样最稳：**不需要判断「今天是哪天、今天是不是交易日」** ——
+        那种判断在周末和节假日一定会算错，而「全市场日线到哪天了」是既成事实。
+
+        ⚠️ 代价：如果某天你还没跑 fetch market 就先跑 fetch watch，这里会认为
+          「已经是最新的」而跳过（因为交易日钟还停在昨天）。想要盘中快照就加 --force。
+
+        ref_day 可以复用到批量场景（一批只查一次交易日钟）。
+        """
+        kind = self._kind_of(str(code).strip().upper())
+        code = str(code).strip().upper() if kind == "board" else str(code).strip().zfill(6)
+        ref = self.db.last_trade_day() if ref_day is None else ref_day
+        if not ref:
+            return False                    # 库里还没有全市场日线 -> 无从判断，老实去拉
+        last = self.db.last_day(kind, code)
+        return bool(last) and last >= ref
+
     # -- 对外主接口 -------------------------------------------------------
     def fetch(self, code: str, days: int | None = None) -> FetchResult:
-        """联网拉取（days=None 只要最新，days=N 要最近 N 个交易日）并落盘。
+        """联网拉取（days=None 只要最新，days=N 要最近 N 个交易日）并入库。
 
-        拿回来的记录会先**统一格式化成本地格式**（见 base.format_record），
-        再按交易日与本地比对，本地没有的才追加；返回 FetchResult。
+        拿回来的记录先对齐成**数据库一行的形状**，再按交易日与本地比对，
+        本地没有的才写；返回 FetchResult。
         """
         code = str(code).strip().upper()
-        source = self._pick_source(code, days)      # 顺带校验代码是否认识
-        kind = "board" if is_board_code(code) else "stock"
+        kind = self._kind_of(code)                  # 顺带校验代码是否认识
+        source = self._pick_source(code, days)
 
         if kind == "board":
             raw = source.fetch_board(code, days=days)
@@ -217,48 +290,127 @@ class Fetcher:
         if not raw:
             raise LookupError(f"{code} 没拉到任何记录（数据源 {source.name}）")
 
-        # 不管数据源给的是什么排列、什么字段，先统一成本地格式再往下走
-        records = [format_record(kind, r, source=source.name) for r in raw]
+        # 数据源给什么字段都行，这里对齐成库里的列（单位原样，不做缩放）
+        rows = [self._to_row(kind, r, code, source.name) for r in raw]
 
         local = self.load(code)
-        self._fill_name(records, local)
+        self._fill_name(kind, code, rows, local)
 
-        have = {r.get("date") for r in local}
-        added = [r for r in records if r.get("date") and r["date"] not in have]
-        if added:
-            self._save(code, local + added)  # 本地没有的交易日才追加落盘
+        have = {r["trade_date"] for r in local}
+        new = [r for r in rows if r["trade_date"] and r["trade_date"] not in have]
+        if new:
+            self._save(code, new)
+        return FetchResult(code=code, fetched=rows, added=new,
+                           total=len(have) + len(new))
 
-        return FetchResult(code=code, fetched=records, added=added,
-                           total=len(local) + len(added))
+    # -- 数据源记录 -> 数据库一行（唯一的翻译层）---------------------------
+    @staticmethod
+    def _to_row(kind: str, rec: dict, code: str, source: str) -> dict:
+        """把数据源给的一条记录对齐成库里的列。
 
-    # -- 旧数据迁移 -------------------------------------------------------
-    def rewrite_local(self, kind: str | None = None) -> dict[str, int]:
-        """把本地已存的旧格式记录，重写成当前统一落盘格式。
+        数据源一律按同一套「对外字段名」给数据（见 base.py 的方法契约）：
+            date · code · price · change_pct …
+        两张表的列名却不一样，所以要在这里翻译：
 
-        判定「旧格式」的依据：**没有 source 字段**（那时成交额还是「元」）。
-        已经有 source 的记录视为已迁移，只重排字段、**不再做单位换算**，
-        所以本方法是可重复执行的，不会把亿/万又当成元再除一次。
+            board_daily: concept · price · change_pct   （和对外名基本一致）
+            stock_daily: code    · close · pct_chg      （tushare 的叫法）
 
-        旧记录一律标成 source="direct" —— 在引入多数据源之前，只有 DirectSource
-        这一个数据源，所以这是准确的。
+        ⚠️ 漏翻一个字段**不会报错**，只会让那一列变成 NULL（价格、涨跌幅全空）——
+           所以「入库 1 行」这种检查是看不出来的，必须有测试盯着每一个字段。
 
-        返回 {kind: 重写的文件数}。
+        三条规则：
+          · 列取自库的定义（表加了列不会漏）；
+          · `code` / `date` 换成库里的列名；
+          · **单位不换算**：数据源按契约给的就是 元 / 股，库里存的也是 元 / 股。
         """
-        kinds = [kind] if kind else ["board", "stock"]
-        done: dict[str, int] = {}
-        for k in kinds:
-            if k not in FIELDS:
-                raise ValueError(f"kind 只能是 'board' 或 'stock'，收到：{k!r}")
-            n = 0
-            for code in self.cached_codes(k):
-                fixed = []
-                for r in self.load(code):
-                    if "source" in r:      # 已是新格式：只重排，不再换算
-                        fixed.append(format_record(k, r, source=r["source"],
-                                                   already_formatted=True))
-                    else:                  # 旧格式：需要把「元」换算成 亿/万
-                        fixed.append(format_record(k, r, source="direct"))
-                self._save(code, fixed)
-                n += 1
-            done[k] = n
-        return done
+        cols = _TABLE_COLS[kind]
+        row = {c: rec.get(c) for c in cols}
+        row["trade_date"] = date_to_int(rec.get("date") or rec.get("trade_date"))
+        row["source"] = rec.get("source") or source    # 这条是哪来的，必须记下来
+        if kind == "board":
+            row["concept"] = code
+        else:
+            row["code"] = code
+            row["close"] = rec.get("close", rec.get("price"))            # price -> close
+            row["pct_chg"] = rec.get("pct_chg", rec.get("change_pct"))   # change_pct -> pct_chg
+        row["name"] = rec.get("name")        # 不是行情表的列，留着给 _save 写字典 / 展示用
+        return row
+
+    # -- 全市场日线（按交易日）--------------------------------------------
+    #
+    # 全市场天生就是「一天一张横截面」，所以直接进 stock_daily 表：
+    # 三千万行也就 2.6 GB，一张表比三千万个文件好伺候得多。
+
+    def _market_source(self) -> DataSource:
+        """全市场日线用哪个数据源：配了 market 就用它，没配就复用 stock。"""
+        name = config.system.get("market") or config.system.get("stock")
+        if not name:
+            raise ValueError("config/system.yaml 里既没配 market 也没配 stock")
+        src = self._source(name)
+        if not hasattr(src, "fetch_market_daily"):
+            raise ValueError(
+                f"数据源 {name!r} 不支持全市场日线："
+                f"market 这个角色需要能 fetch_market_daily 的数据源")
+        return src
+
+    def market(self, trade_date: str | None = None, force: bool = False) -> MarketDay:
+        """拉**全市场某一天**的日线并入库（一天 1 个请求，约 5400 只）。
+
+        缓存优先：指定了交易日、本地也已经有这天、且没有 force -> 一个请求都不发。
+        trade_date=None 时由数据源往回找最近有数据的一天
+        （这种情况必须先问一次才知道是哪天，所以省不掉）。
+
+        force=True：**先拉、拉到了才删旧的再写**。用来修「那天没取全」——
+        写入一律 INSERT OR IGNORE，不先删的话重拉也盖不掉已经写进去的脏行；
+        而先删后拉的话，万一网络失败就把好数据删了，所以顺序不能反。
+        """
+        src = self._market_source()
+
+        if trade_date:
+            day = to_date(trade_date)
+            if not day:
+                raise ValueError(f"看不懂的日期：{trade_date!r}（要 YYYYMMDD 或 YYYY-MM-DD）")
+            if not force:
+                n = self.db.stock_day_counts().get(date_to_int(day), 0)
+                if n:
+                    return MarketDay(day=day, total=n, skipped=True)   # 没联网
+            rows = src.fetch_market_on(day)
+        else:
+            day, rows = src.fetch_market_daily()
+
+        if not rows:
+            return MarketDay(day=day)          # 那天没数据，本地一行没动
+
+        if force:
+            self.db.delete_stock_days([day])
+        added = self.db.save_stock_daily(rows)
+        return MarketDay(day=day, fetched=len(rows), added=added,
+                         total=self.db.stock_day_counts().get(date_to_int(day), 0))
+
+    def market_plan(self, days: int, end: str | None = None) -> list[dict]:
+        """最近 days 个交易日的**补数计划**：[{"day", "rows"}, …]，新的在前。
+
+        rows = 本地已有多少行（0 = 需要联网拉）。补历史前先看一眼，
+        就知道要发多少个请求、哪些天已经不用管了。
+
+        「哪天是交易日」优先问数据源的交易日历（一次请求问清）；
+        问不到就退回按自然日多排一些 —— 没数据的那天会被跳过，不影响正确性。
+        """
+        days = int(days)
+        if days < 1:
+            raise ValueError(f"days 要 >= 1，收到：{days}")
+
+        src = self._market_source()
+        end_day = to_date(end) if end else today_str()
+        if not end_day:
+            raise ValueError(f"看不懂的日期：{end!r}（要 YYYYMMDD 或 YYYY-MM-DD）")
+
+        # 交易日历只覆盖「最近 days 个交易日」所需的自然日（N 个交易日约 1.4N 天，留一倍余量）
+        cal = src.trade_days(_day_span(end_day, days * 2 + 15)[-1], end_day)
+        if cal:
+            picked = cal[-days:]
+        else:
+            picked = _day_span(end_day, int(days * 1.5) + 7)
+
+        have = {date_to_str(d): n for d, n in self.db.stock_day_counts().items()}
+        return [{"day": d, "rows": have.get(d, 0)} for d in reversed(picked)]

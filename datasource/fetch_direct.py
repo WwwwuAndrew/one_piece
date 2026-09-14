@@ -12,16 +12,18 @@ fetch_direct.py —— 直连东方财富「延时行情」的数据源（当天
 **这个数据源只有「当天」**，要历史请用 akshare（板块）/ tushare（个股）。
 
 （方法统一返回 list[dict]：当天就是 1 条，和别的数据源保持同一个契约，
- 这样 Fetcher 才能无差别地合并落盘。）
+ 这样 Fetcher 才能无差别地比对入库。）
 
 为什么是延时行情集群 push2delay：
     AKShare 的板块/个股接口固定访问 push2.eastmoney.com / push2his.eastmoney.com，
     这两个域名在本机网络下会被服务器直接断开；push2delay.eastmoney.com 可正常访问。
 
 请求量（每个标的）：
-    板块：1 个请求。板块的 secid 前缀固定是 90（90.BK1201），直接精准取，
-          不遍历、不翻页。
-    个股：用代码推断市场号精确查询，最多 2 个请求（沪/深/北 需要猜一次）。
+    板块当天：1 个请求。板块的 secid 前缀固定是 90（90.BK1201），直接精准取，
+              不遍历、不翻页。
+    个股当天：用代码推断市场号精确查询，最多 2 个请求（沪/深/北 需要猜一次）。
+    板块成分股：成员数 ÷ 100 向上取整（BK1201 有 521 只 -> 6 个请求）。
+              ⚠️ 所以只能「同步板块字典」时用，绝不能按板块逐个拉行情。
 
 设计约定：
     **有状态的放类里**（连接、超时、重试、间隔 -> DirectSource）；
@@ -152,7 +154,7 @@ def _normalize(row: dict, kind: str) -> dict:
     else:
         rec["date"] = datetime.now(BEIJING).strftime("%Y-%m-%d")
 
-    # 去掉 None，落盘更干净
+    # 去掉 None，入库更干净
     return {k: v for k, v in rec.items() if v is not None}
 
 
@@ -167,6 +169,10 @@ class DirectSource(DataSource):
     TCP + TLS 握手（更快，也更像正常浏览器，不容易被当成脚本）。
     """
 
+    # 入库时写进记录的 source 字段。**必须显式声明** ——
+    # 基类给的是 "base"，不写就会把 "base" 当成「某某数据源」存进去。
+    name = "direct"
+
     def __init__(self,
                  session: requests.Session | None = None,
                  timeout: int = TIMEOUT,
@@ -177,6 +183,9 @@ class DirectSource(DataSource):
         self.timeout = timeout
         self.max_retry = max_retry
         self.interval = interval
+        # 累计发了多少个请求（**含重试**，因为这正是对方看到的数）。
+        # 批量同步板块成分股时把它打出来，心里才有底。
+        self.requests_made = 0
 
     # -- 底层请求 ---------------------------------------------------------
     def _get(self, path: str, params: dict) -> dict:
@@ -184,6 +193,7 @@ class DirectSource(DataSource):
         url = f"https://{HOST}{path}"
         last_err = None
         for attempt in range(1, self.max_retry + 1):
+            self.requests_made += 1
             try:
                 resp = self.session.get(url, params=params, timeout=self.timeout)
                 resp.raise_for_status()
@@ -239,7 +249,7 @@ class DirectSource(DataSource):
         })
         return list((payload.get("data") or {}).get("diff") or [])
 
-    # -- 对外接口（两个）--------------------------------------------------
+    # -- 对外接口：行情（两个）--------------------------------------------
     def fetch_board(self, code: str, days: int | None = None) -> list[dict]:
         """查板块**当天**快照。**1 个请求**：板块 secid 前缀固定是 90，直接精准取。
 
@@ -278,6 +288,43 @@ class DirectSource(DataSource):
         if last_exc is not None:
             raise last_exc
         raise LookupError(f"{code} 没查到数据（代码可能不存在）")
+
+    # -- 板块成分股（板块字典用）------------------------------------------
+    def fetch_board_members(self, code: str) -> list[dict]:
+        """拉某个板块的**成分股名单**，返回 [{"code":..., "name":...}, ...]。
+
+        筛选条件是 `fs = "b:BK1201 f:!50"`（和取「全部行业板块」用的
+        `m:90 t:2 f:!50` 是同一个 clist 接口，只是换了筛选）。
+
+        ⚠️ 请求量 = 成员数 ÷ 100 向上取整（东财单页上限 100）：
+           BK1201 有 521 只 -> 6 个请求。所以**绝不能按板块逐个去拉**
+           （500 个板块 ≈ 3000 个请求）；日常行情走 fetch market，
+           这里只在「同步板块字典」时才用。
+        """
+        code = code.strip().upper()
+        rows = self._clist(f"b:{code} f:!50")
+        if not rows:
+            raise LookupError(f"{code} 没拉到任何成分股（板块代码可能不对）")
+
+        out, seen = [], set()
+        for r in rows:
+            c = str(r.get("f12") or "").strip()
+            if not c or c in seen:
+                continue
+            seen.add(c)
+            out.append({"code": c, "name": str(r.get("f14") or "")})
+        return out
+
+    def fetch_board_name(self, code: str) -> str | None:
+        """取板块名称（1 个请求）。
+
+        成分股接口不返回板块名（它只给股票名），所以名字要单独取一次。
+        """
+        code = code.strip().upper()
+        rows = self._ulist([f"90.{code}"])
+        if rows and rows[0].get("f14"):
+            return str(rows[0]["f14"])
+        return None
 
     @staticmethod
     def _reject_history(what: str, days: int | None) -> None:
