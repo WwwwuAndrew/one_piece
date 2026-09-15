@@ -234,6 +234,11 @@ h1 { font-size: 18px; margin: 0 0 4px; }
 .tab.active { background: #2f6fed; color: #fff; border-color: #2f6fed; }
 .panel { display: none; }
 .panel.active { display: block; }
+h2.sec { font-size: 15px; margin: 18px 0 8px; color: #1f2430; }
+h2.sec .lv { font-size: 11px; color: #8a93a3; font-weight: 400; margin-left: 6px; }
+h3.sub { font-size: 13px; margin: 16px 0 6px; color: #2f6fed;
+         border-left: 3px solid #2f6fed; padding-left: 8px; }
+h3.sub .code { color: #8a93a3; font-weight: 400; font-size: 11px; margin-left: 6px; }
 .wrap { overflow: auto; max-height: 72vh; border: 1px solid #e2e6ec;
         border-radius: 10px; background: #fff; }
 table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 13px; }
@@ -512,6 +517,104 @@ def _render(codes: list[str], days: int) -> tuple[str, list[str]]:
         + "<script>" + _JS + "</script></body></html>"
     )
     return html, missing
+
+
+# ---------------------------------------------------------------------------
+# 分组展示：一个一级板块 = 一个标签，面板里先是一级自己，再依次是它的二级
+# ---------------------------------------------------------------------------
+
+def _board_block(code: str, records: list[dict], days: int,
+                 heading: str | None = None) -> str:
+    """一个板块的一屏：小标题（可选）+ 柱状图 + 明细表。"""
+    key = _kind_key(code)
+    name = records[-1].get("name") or ""
+    title = heading or f"{code} {name}".strip()
+    return (f'<h3 class="sub">{title}<span class="code">{code}</span></h3>'
+            f'<div class="chart-card">{_legend_html(key, records)}'
+            f'{_chart_svg(key, records)}</div>'
+            f'<div class="wrap">{_html_table(records)}</div>')
+
+
+def _render_grouped(groups: list[tuple[str, list[str]]],
+                    days: int) -> tuple[str, list[str]]:
+    """一级一个标签；面板里一级的数据在最上面，下面依次排它的二级。
+
+    groups : [(一级代码, [二级代码, …]), …]
+    """
+    fetcher = Fetcher()
+    tabs: list[tuple[str, str, str]] = []
+    missing: list[str] = []
+
+    for parent, children in groups:
+        try:
+            prows = fetcher.history(parent, days=days)
+        except Exception as exc:
+            missing.append(f"{parent}（{exc}）")
+            continue
+        if not prows:
+            missing.append(parent)
+            continue
+
+        pname = prows[-1].get("name") or parent
+        parts = [_board_block(parent, prows, days,
+                             heading=f"{pname}（一级）")]
+        shown = 0
+        for child in children:
+            try:
+                crows = fetcher.history(child, days=days)
+            except Exception:
+                continue
+            if not crows:
+                missing.append(child)
+                continue
+            cname = crows[-1].get("name") or child
+            parts.append(_board_block(child, crows, days,
+                                     heading=f"{cname}（二级）"))
+            shown += 1
+        if shown:
+            # 二级那一堆前面加一个说明，免得看不清分组
+            parts.insert(1, f'<h2 class="sec">二级板块 {shown} 个'
+                            f'<span class="lv">（同一级的成分股之和，会大于一级自身）</span></h2>')
+        tabs.append((parent, f"{parent} {pname}", "".join(parts)))
+
+    if not tabs:
+        return "", missing
+
+    buttons, panels = [], []
+    for i, (code, label, body) in enumerate(tabs):
+        active = " active" if i == 0 else ""
+        buttons.append(f'<button class="tab{active}" data-tab="{code}" '
+                       f'onclick="showTab(\'{code}\')">{label}</button>')
+        panels.append(f'<div class="panel{active}" id="panel-{code}">{body}</div>')
+
+    html = (
+        '<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">'
+        "<title>板块势能 · 一级/二级</title><style>" + _CSS + "</style></head><body>"
+        f"<h1>板块势能 · 一级 / 二级（最近 {days} 个交易日）</h1>"
+        '<div class="tabs">' + "".join(buttons) + "</div>"
+        + "".join(panels)
+        + "<script>" + _JS + "</script></body></html>"
+    )
+    return html, missing
+
+
+def gui_grouped(groups: list[tuple[str, list[str]]], days: int = 15) -> None:
+    """一级一个标签，面板里一级在上、它的二级依次在下。"""
+    import webbrowser
+
+    html, missing = _render_grouped(groups, days)
+    if missing:
+        print(f"⚠️  {len(missing)} 个板块本地还没有数据，已跳过（先跑："
+              f"python3 hunter.py fetch board）")
+        if len(missing) <= 8:
+            print("      " + ", ".join(missing))
+    if not html:
+        return
+
+    _VIEW_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _VIEW_FILE.write_text(html, encoding="utf-8")
+    webbrowser.open(_VIEW_FILE.as_uri())
+    print(f"已在浏览器打开：{_VIEW_FILE}")
 
 
 def gui(codes: list[str], days: int = 15) -> None:

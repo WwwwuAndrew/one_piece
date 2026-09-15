@@ -1,36 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fetch_akshare.py —— 基于 AKShare 的**板块历史**数据源。
+fetch_akshare.py —— AKShare 数据源（只做板块历史；数据同样来自东财）。
 
-    from datasource.fetch_akshare import AkshareSource
     src = AkshareSource()
-    src.fetch_board("BK1201", days=15)       # -> [最近 15 个交易日]
+    src.fetch_board("BK1201", days=15)     # 最近 15 个交易日
 
-只支持板块历史。当天快照请用 DirectSource（更快、1 个请求），个股请用 TushareSource。
+只支持板块：`fetch_stock` 会明确报错。走的是 akshare 的 `stock_board_industry_hist_em`，
+它接受 BK 代码（形如 BK 加数字就直接用，不去查板块名）。
 
-用到的 AKShare 接口：
-    ak.stock_board_industry_hist_em(symbol, start_date, end_date, period="日k", adjust="")
-        东方财富网-沪深板块-行业板块-历史行情。
-
-        ⚠️ docstring 写的是「symbol: 板块名称」，但**看实现才知道可以直接传 BK 代码**：
-             if re.match(r"^BK\\d+", symbol):  em_code = symbol
-             else:                             # 传名称才去查一遍板块列表
-        所以传 "BK1201" 就行，不需要先查名字、也不会多一个请求。
-
-        实际请求：
-            http://7.push2his.eastmoney.com/api/qt/stock/kline/get?secid=90.BK1201&...
-        ⚠️ 这是 push2his 集群、且是 http —— 就是本机之前被 RemoteDisconnected 的那个集群。
-            （push2delay 只提供 clist/快照，不提供 kline 历史，所以历史只能走这里。）
-
-    ⚠️ 返回的历史数据**没有涨跌家数**：
-        涨跌家数是横截面统计量，历史接口只给价格序列（11 列）：
-        日期/开盘/收盘/最高/最低/成交量/成交额/振幅/涨跌幅/涨跌额/换手率。
-        所以板块的历史记录里不会带 up/down/flat，只有当天快照（DirectSource）才有。
-
-    ⚠️ 也**没有 name**：
-        这个接口不返回板块名称。所以名字只能靠本地已有记录补（Fetcher 会做这件事），
-        或者你先前用 direct 拉过一次当天快照。
+⚠️ 那个接口**不返回成交量**，所以这里的记录里没有 volume ——
+   单位没验证过的东西不往库里写。
 """
 
 from __future__ import annotations

@@ -4,3 +4,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
+# SQLite 的 WAL 伴随文件（跑着的时候才有，别提交）
+*.sqlite-wal
+*.sqlite-shm

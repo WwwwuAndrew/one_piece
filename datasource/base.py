@@ -1,73 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-base.py —— 数据源基类 + 全项目共用的代码/数值工具。
+base.py —— 数据源基类 + 全项目共用的工具函数。
 
-所有数据源都继承 `DataSource`，并**只覆盖自己支持的方法**：
+所有数据源继承 DataSource，只覆盖自己支持的方法，不支持的直接抛 NotImplementedError。
+（故意不用 abc：三个来源支持的范围本来就不一样，给个「不支持就报错」的默认实现更诚实。）
 
-    class DirectSource(DataSource):
-        def fetch_board(self, code, days=None) -> list[dict]: ...
-        def fetch_stock(self, code, days=None) -> list[dict]: ...
+方法契约
+    · 统一返回 list[dict]；days=None 只要最新一条，days=N 要最近 N 个交易日。
+    · 金额一律给**元**、成交量给**股**（tushare 的「千元 / 手」要在数据源里先换算）。
+    · 字段名一律用这套对外名：
+          date · code · name · price · change_pct · change
+          open · high · low · pre_close · volume · amount
+      两张表的列名**并不一样**（板块 price/change_pct，个股 close/pct_chg），
+      翻成各表的列名是 Fetcher._to_row 一个地方的事 —— 漏翻不会报错，
+      只会让那一列静默变 NULL，所以那条路必须有测试盯着。
+    · 字段可以少给（拿不到的就不给），入库时缺的自动是 NULL。
+    · 拿不到的能力要明确报错，绝不静默少返回数据。
 
-    class AkshareSource(DataSource):
-        def fetch_board(self, code, days=None) -> list[dict]: ...   # 只支持板块
-
-    class TushareSource(DataSource):
-        def fetch_stock(self, code, days=None) -> list[dict]: ...   # 只支持个股
-
-这里**故意不用 abc.ABC**：因为不同数据源支持的范围不一样（direct 当天有、
-akshare 只有板块、tushare 只有个股），基类给每个方法一个「不支持就报错」的
-默认实现，比强制子类实现一个假的空方法更诚实。
-
-======================================================================
-方法契约（所有数据源必须遵守）
-======================================================================
-
-1. **统一返回 `list[dict]`**
-   当天通常 1 条，历史多天多条。统一成列表，Fetcher 才能无差别地比对入库。
-
-2. **`days` 的含义**
-   `days=None` -> 只要最新的那一条（当天快照）
-   `days=N`    -> 最近 N 个交易日
-
-3. **金额 / 成交量一律给「原始单位」**
-   金额 = **元**，成交量 = **股**。
-   （tushare 的「千元」「手」要在数据源里先换算成 元 / 股。）
-   入库时**原样存**，不做任何缩放 —— 这样以后换数据源，库里也不会多出一层换算错。
-
-4. ★ **字段名一律用这一套「对外名」**（板块 / 个股都一样，别各叫各的）：
-
-       日期 date · 代码 code · 名字 name
-       价格 price · 涨跌幅 change_pct · 涨跌额 change
-       开 open · 高 high · 低 low · 昨收 pre_close · 量 volume · 额 amount(元)
-
-   为什么必须统一：**两张表的列名并不一样**
-   （板块是 `price` / `change_pct`，个股是 `close` / `pct_chg` —— 后者是 tushare 的叫法）。
-   数据源只管按上面这套名字给，翻成各表的列名是 `Fetcher._to_row` **一个地方**的事。
-   ⚠️ 那里漏翻一个字段不会报错，只会让那一列静默变成 NULL（价格、涨跌幅全空）。
-
-5. **字段可以少给**（拿不到的就不给），写库时缺的自动是 NULL：
-   **列一定在，只是没值**。列的集合由数据库的建表语句（store.py）唯一决定，
-   不再由代码里的一份字段清单维护 —— 表结构就是契约，改了表就一定会被发现。
-
-6. **拿不到的能力要明确报错**，绝不能静默少返回数据。
-
-======================================================================
-数据层：数据库是唯一的落盘格式
-======================================================================
-
-`data/raw/raw.sqlite` 里的表就是唯一真相（早期用过 jsonl，已彻底退役）：
-
-    stock_daily    (code, trade_date, open, high, low, close, pre_close,
-                    change, pct_chg, volume, amount)          amount=元 volume=股
-    board_daily    (concept, trade_date, source, price, change_pct, ...)
-    board_list     (concept, name, member_updated_at)
-    concept_member (concept, code)
-
-所以：
-  · 「同类记录长得一样」由**表结构**保证，不需要代码再拼一份固定字段；
-  · 内存里的记录 = 数据库的一行（列名、单位全都跟库里一致）；
-  · 换算成「亿 / 万」只发生在展示那一步（fmt_amount / show_data）。
+数据层
+    data/raw/raw.sqlite 里的表是唯一真相（早期用过 jsonl，已退役）。
+    库里存**原始单位**（元 / 股），换算成「亿 / 万」只发生在展示那一步。
 """
 
 from __future__ import annotations

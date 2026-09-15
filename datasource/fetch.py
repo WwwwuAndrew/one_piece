@@ -3,41 +3,23 @@
 """
 fetch.py —— 数据获取主接口：按配置选数据源 + 联网拉取 + 按交易日入库。
 
-    from datasource.fetch import Fetcher
     f = Fetcher()
-    f.fetch("BK1201")             -> FetchResult  板块当天快照
-    f.fetch("BK1201", days=15)    -> FetchResult  板块最近 15 个交易日
-    f.fetch("300308")             -> FetchResult  个股最新一天
-    f.fetch("300308", days=15)    -> FetchResult  个股最近 15 个交易日
-    f.history("BK1201", days=15)  -> list[dict]   读本地（不联网）
-    f.load("BK1201")              -> list[dict]   读本地全部
-    f.cached_codes("board")       -> list[str]    本地已有哪些板块
+    f.fetch("BK1201")               -> FetchResult  板块当天快照
+    f.fetch("BK1201", days=15)      -> FetchResult  板块最近 15 个交易日
+    f.fetch("300308")               -> FetchResult  个股最新一天
+    f.history("BK1201", days=15)    -> list[dict]   读本地（不联网）
+    f.cached_codes("board")         -> list[str]    本地已有哪些板块
+    f.market("20260915")            -> MarketDay    全市场某一天（1 个请求）
+    f.market_plan(30)               -> list[dict]   最近 30 个交易日的补数计划
+    f.is_up_to_date("BK1201")       -> bool         本地是不是已经最新（0 个请求）
 
-    # 全市场（走数据库，一天 1 个请求）
-    f.market()                    -> MarketDay    拉最近有数据的一天
-    f.market("20260911")          -> MarketDay    拉指定交易日（本地已有则跳过）
-    f.market("20260911", force=True) -> MarketDay 重拉这天（先删后写）
-    f.market_plan(30)             -> list[dict]   最近 30 个交易日的补数计划（谁有谁没有）
+流程：挑数据源 → 联网拉 → 对齐成库的列（单位原样）→ 按交易日与本地比对 → 缺的才写。
+存什么永远由数据源返回的交易日决定，**不做「今天是哪天」的判断**，所以周末节假日不会算错。
 
-数据源路由（在 config/system.yaml 里配）：
-    board_today    板块「当天」用哪个数据源   （默认 direct）
-    board_history  板块「历史」用哪个数据源   （默认 akshare，数据同样来自东财）
-    stock          个股（当天 + 历史）        （默认 tushare）
-    market         全市场日线                 （不配则复用 stock）
-    可选名字见下面的 SOURCE_FACTORIES：direct / akshare / tushare
+数据源路由（config/system.yaml）：board_today / board_history / stock / market
+（market 不配就复用 stock）。
 
-fetch 的流程：
-    1. 按上面的配置挑一个数据源；
-    2. 联网拉取（days=None 只要最新一条，days=N 要最近 N 个交易日）；
-    3. 数据源给的原值（金额=元、成交量=股）**原样**对齐成数据库的列；
-    4. 拿回来的每条记录按交易日与本地比对，本地没有的才写进去（同一交易日不覆盖）。
-
-存什么永远由数据源返回的交易日决定，**不做任何「今天是哪天」的判断**，
-所以周末、法定节假日都不会算错。
-
-板块和个股都直接进数据库（`data/raw/raw.sqlite`）。
-  内存里的记录 = 「数据库的一行」（列名 / 单位都跟库里一致），
-  所以调用方（boards / stock / show_data）完全不必知道数据存在哪儿。
+记录的形状 = **数据库的一行**（列名和单位都跟库里一致），调用方不需要知道数据存在哪儿。
 """
 
 from __future__ import annotations
@@ -87,11 +69,11 @@ class FetchResult:
 
 @dataclass
 class MarketDay:
-    """全市场「某一个交易日」的拉取结果。
+    """
+    全市场「某一个交易日」的拉取结果。
 
-    skipped=True 表示本地已经有这天，**一个请求都没发**（缓存优先）。
-    empty（fetched=0 且没跳过）表示联网问了，但那天没数据 ——
-    非交易日、或数据还没发布，都不是错误。
+    skipped = 本地已有这天，一个请求都没发；empty = 联网问了但那天没数据
+    （非交易日或还没发布），都不是错误。
     """
 
     day: str | None = None      # 对应的交易日 "YYYY-MM-DD"
@@ -126,10 +108,11 @@ def _day_span(end_day: str, back: int) -> list[str]:
 # ---------------------------------------------------------------------------
 
 class Fetcher:
-    """按配置挑数据源，把「拉取 -> 比对交易日 -> 入库」编排起来。
+    """
+    按配置挑数据源，把「拉取 → 比对交易日 → 入库」编排起来。
 
-    sources : 名字 -> 数据源实例，用来覆盖默认工厂（测试、临时换源用）
-    db      : 数据落到哪个库，默认 data/raw/raw.sqlite（测试时可指向临时库）
+    sources : 名字 → 数据源实例，用来覆盖默认工厂（测试、临时换源用）
+    db      : 数据落到哪个库，默认 data/raw/raw.sqlite
     """
 
     def __init__(self,
@@ -178,10 +161,8 @@ class Fetcher:
         raise ValueError(f"无法识别的代码：{code}（板块形如 BK1201，个股形如 300308）")
 
     def cached_codes(self, kind: str) -> list[str]:
-        """本地已经有哪些代码。kind: 'board' | 'stock'。
-
-        板块 = board_daily 里出现过的；个股 = stock_daily 里出现过的。
-        （个股是全市场入库的，所以这里通常会返回几千个 —— 这是对的。）
+        """
+        本地已经有哪些代码。个股是全市场入库的，所以通常返回几千个 —— 这是对的。
         """
         if kind not in ("board", "stock"):
             raise ValueError(f"kind 只能是 'board' 或 'stock'，收到：{kind!r}")
@@ -191,10 +172,8 @@ class Fetcher:
             f"SELECT DISTINCT {col} FROM {table} ORDER BY {col}")]
 
     def load(self, code: str) -> list[dict]:
-        """读本地记录（升序）。
-
-        记录 = 数据库的一行 + `name`：名字属于「字典」不属于行情，
-        所以它不在行情表里，要从 board_list / stock_list 补上。
+        """
+        读本地记录（升序）。记录 = 数据库一行 + `name`（名字在字典表里，不在行情表）。
         """
         code = str(code).strip().upper()
         kind = self._kind_of(code)
@@ -238,10 +217,8 @@ class Fetcher:
             self.db.upsert_stock_list(names)
 
     def _fill_name(self, kind: str, code: str, rows: list[dict], local: list[dict]) -> None:
-        """数据源没给名字时，从本地已有记录 / 字典表里补上（就地改 rows）。
-
-        最典型的是 akshare 的板块历史：那个接口根本不返回板块名称。
-        补不到就算了，不报错、也不编造。
+        """
+        数据源没给名字时，从本地记录 / 字典表补上。补不到就算了，不报错也不编造。
         """
         name = (next((r.get("name") for r in reversed(local) if r.get("name")), None)
                 or self.dict_name(kind, code))
@@ -253,16 +230,12 @@ class Fetcher:
 
     # -- 本地是不是最新的（0 个请求就能判断）-------------------------------
     def is_up_to_date(self, code: str, ref_day: int | None = None) -> bool:
-        """本地已经有「最新交易日」的数据了吗？—— **不用联网**。
+        """
+        本地已经有「最新交易日」的数据了吗？—— **不用联网**。
 
         判据：这个标的本地最后一天 >= 全市场日线覆盖到的最后一天（交易日钟）。
-        为什么这样最稳：**不需要判断「今天是哪天、今天是不是交易日」** ——
-        那种判断在周末和节假日一定会算错，而「全市场日线到哪天了」是既成事实。
-
-        ⚠️ 代价：如果某天你还没跑 fetch market 就先跑 fetch watch，这里会认为
-          「已经是最新的」而跳过（因为交易日钟还停在昨天）。想要盘中快照就加 --force。
-
-        ref_day 可以复用到批量场景（一批只查一次交易日钟）。
+        好处是**不需要判断「今天是哪天、今天开不开市」**（那种判断在节假日一定算错）。
+        代价：还没跑 fetch market 就先跑 fetch watch 的话，它会以为已经最新而跳过（要盘中快照就 --force）。
         """
         kind = self._kind_of(str(code).strip().upper())
         code = str(code).strip().upper() if kind == "board" else str(code).strip().zfill(6)
@@ -306,22 +279,12 @@ class Fetcher:
     # -- 数据源记录 -> 数据库一行（唯一的翻译层）---------------------------
     @staticmethod
     def _to_row(kind: str, rec: dict, code: str, source: str) -> dict:
-        """把数据源给的一条记录对齐成库里的列。
+        """
+        把数据源给的一条记录对齐成库里的列 —— **这里是唯一的翻译层**。
 
-        数据源一律按同一套「对外字段名」给数据（见 base.py 的方法契约）：
-            date · code · price · change_pct …
-        两张表的列名却不一样，所以要在这里翻译：
-
-            board_daily: concept · price · change_pct   （和对外名基本一致）
-            stock_daily: code    · close · pct_chg      （tushare 的叫法）
-
-        ⚠️ 漏翻一个字段**不会报错**，只会让那一列变成 NULL（价格、涨跌幅全空）——
-           所以「入库 1 行」这种检查是看不出来的，必须有测试盯着每一个字段。
-
-        三条规则：
-          · 列取自库的定义（表加了列不会漏）；
-          · `code` / `date` 换成库里的列名；
-          · **单位不换算**：数据源按契约给的就是 元 / 股，库里存的也是 元 / 股。
+        数据源按「对外字段名」给数据（见 base.py），两张表的列名却不一样，所以要翻：
+        board 是 concept / price / change_pct，stock 是 code / close / pct_chg。
+        ⚠️ 漏翻一个字段不会报错，只会让那一列静默变成 NULL，所以必须有测试盯着。
         """
         cols = _TABLE_COLS[kind]
         row = {c: rec.get(c) for c in cols}
@@ -354,15 +317,12 @@ class Fetcher:
         return src
 
     def market(self, trade_date: str | None = None, force: bool = False) -> MarketDay:
-        """拉**全市场某一天**的日线并入库（一天 1 个请求，约 5400 只）。
+        """
+        拉**全市场某一天**的日线并入库（一天 1 个请求，约 5500 只）。
 
-        缓存优先：指定了交易日、本地也已经有这天、且没有 force -> 一个请求都不发。
-        trade_date=None 时由数据源往回找最近有数据的一天
-        （这种情况必须先问一次才知道是哪天，所以省不掉）。
-
-        force=True：**先拉、拉到了才删旧的再写**。用来修「那天没取全」——
-        写入一律 INSERT OR IGNORE，不先删的话重拉也盖不掉已经写进去的脏行；
-        而先删后拉的话，万一网络失败就把好数据删了，所以顺序不能反。
+        缓存优先：本地已经有这天、又没 force，就一个请求都不发。
+        force = **先拉、拉到了才删旧的再写** —— 写入是 INSERT OR IGNORE，不先删就盖不掉脏行；
+        反过来先删后拉，网络一失败就把好数据删了。
         """
         src = self._market_source()
 
@@ -388,12 +348,10 @@ class Fetcher:
                          total=self.db.stock_day_counts().get(date_to_int(day), 0))
 
     def market_plan(self, days: int, end: str | None = None) -> list[dict]:
-        """最近 days 个交易日的**补数计划**：[{"day", "rows"}, …]，新的在前。
+        """
+        最近 days 个交易日的**补数计划**：[{"day", "rows"}, …]，新的在前。
 
-        rows = 本地已有多少行（0 = 需要联网拉）。补历史前先看一眼，
-        就知道要发多少个请求、哪些天已经不用管了。
-
-        「哪天是交易日」优先问数据源的交易日历（一次请求问清）；
+        rows = 本地已有多少行（0 = 要联网拉）。「哪天是交易日」优先问数据源的交易日历，
         问不到就退回按自然日多排一些 —— 没数据的那天会被跳过，不影响正确性。
         """
         days = int(days)

@@ -1,53 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fetch_tushare.py —— 基于 tushare 的数据源（全市场 + 单只个股）。
+fetch_tushare.py —— tushare 数据源（全市场日线 + 个股 + 个股字典）。
 
-    from datasource.fetch_tushare import TushareSource
-    src = TushareSource()                    # token 从 config/system.yaml 的 tushare_token 读
+    src = TushareSource()                    # token 从 config/system.yaml 读
+    day, rows = src.fetch_market_daily()     # ★ 全市场最近有数据的一天（1 个请求）
+    rows = src.fetch_market_on("2026-09-15") # 严格只这一天，没有就 []
+    src.fetch_stock("300308", days=15)       # 单只个股
+    src.fetch_stock_list()                   # 全市场名字（1 个请求）
+    days = src.trade_days("2026-08-01", "2026-09-15")   # 交易日历
 
-    # ★ 全市场：1 个请求拿全部 ~5400 只（这是架构的地基）
-    day, rows = src.fetch_market_daily()              # 自动往回找到最近有数据的一天
-    day, rows = src.fetch_market_daily("20260911")    # 指定交易日
-    rows = src.fetch_market_on("2026-09-10")          # 严格只要这天，没有就 []（补历史用）
-    days = src.trade_days("2026-08-01", "2026-09-11") # 区间里开市的日子（补历史用）
+只支持个股和全市场；`fetch_board` 会明确报错（板块走 direct / akshare）。
 
-    # 单只个股
-    src.fetch_stock("300308")                # -> [最新一天]
-    src.fetch_stock("300308", days=15)       # -> [最近 15 个交易日]
+★ 关键：tushare 官方建议**循环日期取全市场，不要循环 ts_code**。
+  单次上限 6000 条而全市场约 5500 只，所以**一天 1 个请求** ——
+  这正是「东财只做板块字典、行情只拉一次」那套架构成立的前提。
 
-    # 个股字典（代码 -> 名字）：1 个请求拿全部
-    src.fetch_stock_list()                   # -> [{"code": "000001", "name": "平安银行"}, …]
-
-只支持个股；`fetch_board` 会明确报错（板块走 direct / akshare，都是东财的数据）。
-
-用到的 tushare 接口：
-    pro.daily(trade_date)          ★ 按**交易日**取全市场（推荐）
-        tushare 官方明确建议：**循环日期提取全市场，不要循环 ts_code**。
-        单次最多 6000 条，而全市场约 5400 只 —— 所以**一天 1 个请求就够**。
-        这也正是「东财只做板块字典、行情只拉一次」那套架构能成立的前提。
-
-    pro.trade_cal(exchange, start_date, end_date, is_open="1")
-        交易日历：一次请求问清「哪几天开市」，补历史时就不用按自然日瞎猜 ——
-        周末和长假一天都不浪费。拿不到会自动退回按自然日排（见 trade_days）。
-
-    pro.daily(ts_code, start_date, end_date)
-        ts_code 形如 "300308.SZ"（不是 300308），所以要用 base.to_ts_code() 转。
-        返回字段：ts_code, trade_date, open, high, low, close,
-                  pre_close, change, pct_chg, vol, amount
-
-    pro.stock_basic(fields="ts_code,name")          ★ 一次拿全市场名字
-        daily **不返回股票名字**，所以名字单独拉一次全量（约 5500 只 = 1 个请求），
-        存进 stock_list 字典表。这比「每只股票查一次名字」省 5500 倍请求。
-
-⚠️ 单位换算（tushare 和东财不一样，必须换，否则存进去就是错的）：
-    vol    tushare 是「手」   -> 统一存「股」：× 100
-    amount tushare 是「千元」 -> 统一存「元」：× 1000
-    （换算后正好和 store.stock_daily 的列单位一致：volume=股、amount=元）
-
-⚠️ 拿不到的东西（tushare daily 本身不提供，不在同一次请求里）：
-    换手率、振幅、量比、总市值 —— 这些在 pro.daily_basic 接口里，是**另一次请求**。
-    目前不取，所以历史记录里没有这几个字段；需要的话再加。
+⚠️ 单位换算（tushare 和东财不一样，必须换）：
+      vol    手   -> 股   × 100
+      amount 千元 -> 元   × 1000
+⚠️ `daily` 不返回名字、也不返回换手率/振幅/量比/市值（那些在 daily_basic，是另一次请求）。
+   名字用 fetch_stock_list() 一次拉全量，别按只查。
 """
 
 from __future__ import annotations
@@ -71,11 +44,11 @@ _MARKET_ROW_LIMIT = 5900
 
 
 def _recent_days(n: int) -> list[str]:
-    """从今天往回 n 个自然日，新的在前（"YYYY-MM-DD"）。
+    """
+    从今天往回 n 个自然日，新的在前。
 
-    注意：这里的「今天」只是**当查询参数**用（该去问哪一天），
-    **不是**判断哪天是交易日 —— 到底哪一天真有数据，由 tushare 返回的内容决定。
-    所以周末、节假日都不会算错，只是多问一两次。
+    「今天」只是查询参数（该去问哪一天），**不是**判断哪天是交易日 ——
+    哪天真有数据由 tushare 返回的内容决定，所以周末节假日都不会算错。
     """
     today = datetime.now(BEIJING).date()
     return [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(n)]
@@ -102,13 +75,11 @@ class TushareSource(DataSource):
 
     # -- 交易日历 ---------------------------------------------------------
     def trade_days(self, start, end) -> list[str]:
-        """区间里**开市**的交易日（升序，"YYYY-MM-DD"）。
+        """
+        区间里**开市**的交易日（升序）。补历史时用它，比按自然日一天天问省请求。
 
-        补历史时用它，比按自然日一天天问省事也省请求：一次问清哪几天开市，
-        周末和长假一个请求都不浪费。
-
-        拿不到就返回空列表（由调用方退回「按自然日排」），**不抛错** ——
-        「交易日历取不到」不该让整个补数据失败，那只是少了点优化。
+        拿不到就返回空列表（调用方退回按自然日排），**不抛错** ——
+        交易日历取不到只是少了点优化，不该让整个补数失败。
         """
         s, e = to_date(start), to_date(end)
         if not s or not e:
@@ -126,12 +97,11 @@ class TushareSource(DataSource):
 
     # -- ★ 全市场日线（架构的地基：1 个请求拿全市场）----------------------
     def fetch_market_on(self, day) -> list[dict]:
-        """**严格**拉某一天的全市场日线，只认这一天。
+        """
+        **严格**拉某一天的全市场日线，只认这一天。
 
-        那天没数据（非交易日 / 数据还没发布）就返回 []，**不往回找、不抛错** ——
+        那天没数据（非交易日 / 还没发布）就返回 []，不往回找也不抛错 ——
         补历史时要的就是「这天到底有没有」，替它做主反而会算错。
-
-        记录列表的列名已经对齐 store.stock_daily（volume=股、amount=元）。
         """
         day = to_date(day)
         ds = (day or "").replace("-", "")
@@ -152,14 +122,11 @@ class TushareSource(DataSource):
         return self._market_records(df)
 
     def fetch_market_daily(self, trade_date=None, max_back: int = 10):
-        """拉全市场**最近有数据的**一天。**1 个请求**（约 5400 条）。
+        """
+        拉全市场**最近有数据的**一天（1 个请求，约 5500 条）。
 
-        trade_date : "20260911" / "2026-09-11"，给了就只要这一天（没有则报错）；
-                     不给则从今天往回找，找到第一个有数据的日子为止
-                     （周末 / 节假日 / 今天还没发布，都会自动往前退）。
-        max_back   : 最多往回找多少个自然日（防止死循环）。
-
-        返回 (实际拿到的交易日 "YYYY-MM-DD", 记录列表)。
+        trade_date 给了就只要这一天（没有则报错）；不给就从今天往回找，
+        周末 / 节假日 / 今天还没发布都会自动往前退。
         """
         days = [to_date(trade_date)] if trade_date else _recent_days(max_back)
         days = [d for d in days if d]
@@ -207,12 +174,11 @@ class TushareSource(DataSource):
 
     # -- 个股字典（代码 → 名字）------------------------------------------
     def fetch_stock_list(self) -> list[dict]:
-        """拉**全部**股票的代码 + 名字。**1 个请求**（约 5500 只）。
+        """
+        拉**全部**股票的代码 + 名字（1 个请求，约 5500 只）。
 
-        名字属于「字典」不属于行情，所以它单独一次拉全量，落在 `stock_list` 表里；
-        `daily` 是不返回名字的，所以拿行情的时候顺手带不上。
-
-        返回 [{"code": "000001", "name": "平安银行"}, …]。
+        名字属于「字典」不属于行情，所以单独拉一次全量存进 stock_list；
+        `daily` 不返回名字，按只查要 5500 个请求。
         """
         try:
             df = self.pro.stock_basic(fields="ts_code,name")

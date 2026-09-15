@@ -1,44 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-store.py —— SQLite 存取层。
+store.py —— SQLite 存取层。按「**能不能重建**」分两个库（判据不是体积）：
 
-按「**能不能重建**」分成两个库（这是分库的判据，不是体积）：
+    data/raw/raw.sqlite      原始数据，全都能重新下载，删了不可惜
+        stock_daily      全市场个股日线（一天约 5550 行）  amount=元 volume=股
+        stock_list       个股字典（代码 → 名字）
+        board_daily      板块日线（一级 + 二级）
+        board_list       板块字典（代码 → 名称 + 成员同步时间）
+        board_tree       板块层级（一级/二级 + 上级），来自申万分类
+        concept_member   板块 → 成员（**快照**，没有日期列）
 
-    data/raw/raw.sqlite          Layer A · 原始数据 —— 全都能重新下载，删了不可惜
-        stock_daily      全市场个股日线（一天约 5550 行）
-        stock_list       个股字典（代码 → 名字）★ 名字属于字典，不属于行情
-        board_daily      东财板块日线
-        board_list       板块字典（代码 → 名称 + 成员同步时间，**纯字典**）
-        concept_member   板块 → 成员（快照式，没有日期列）
-
-    data/local.sqlite            本地状态 —— **既下不到、也算不出，删了就真没了**
+    data/local.sqlite        **既下不到、也算不出**，删了就真没了，所以单独一个文件
         watchlist        自选（板块 + 个股共用一张表）
 
-为什么自选要单独一个文件：
-    raw 里的东西全都能重新下载，所以你想「把全市场重新拉一遍」时可以放心重建 raw；
-    但自选丢了就没了。分开之后两者互不影响，而且自选只有几行，
-    单独一个几 KB 的文件还能单独备份 / 进 git。
+跨库**不需要 JOIN** —— 自选读出来就是个 Python 列表，直接 `WHERE code IN (...)` 用。
 
-    跨库**不需要 JOIN** —— 自选读出来就是一个 Python 列表，
-    直接 `WHERE code IN (...)` 用即可，所以没有 ATTACH 那种复杂度。
+⚠️ 单位：库里一律存**原始单位**（amount = 元，volume = 股）。
+   Layer A 只采不算，换算成 亿/万 是展示层的事。
 
-用法：
-    from datasource.store import store, local
-    store.save_stock_daily(rows)              # 全市场某天
-    store.replace_board_members("BK1201", codes)
-    local.watch("board", "BK1201", name="电子")
-    local.load_watchlist()
+⚠️ 库路径可用环境变量覆盖：`ONEPIECE_RAW_DB` / `ONEPIECE_LOCAL_DB`。
 
-⚠️ 单位约定：库里一律存**原始单位**（amount = 元，volume = 股）。
-   Layer A 只采不算；展示时再换算成 亿/万（base.fmt_amount 已做好）。
-
-自检：
-    python3 -m datasource.store        # 用临时库跑一遍建表/写入/查询，不碰 data/
+自检：python3 -m datasource.store      # 用临时库跑一遍，不碰 data/
 """
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -46,8 +34,16 @@ from pathlib import Path
 from .base import BEIJING, to_date
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-DEFAULT_RAW_DB = DATA_DIR / "raw" / "raw.sqlite"
-DEFAULT_LOCAL_DB = DATA_DIR / "local.sqlite"
+
+# ★ 库的路径可以被环境变量改掉。默认当然是项目里的 data/，
+#   但这给了一个**结构性的保险**：测试（或想拿副本试玩的场景）只要在 import 之前设好
+#       ONEPIECE_RAW_DB=/tmp/x/raw.sqlite   ONEPIECE_LOCAL_DB=/tmp/x/local.sqlite
+#   那么**任何**代码路径（包括忘了注入 db 的那些）都不可能写到真实库上去 ——
+#   靠「记得给每个入口注入临时库」是防不住的，我在这上面栽过。
+DEFAULT_RAW_DB = Path(os.environ.get("ONEPIECE_RAW_DB")
+                      or (DATA_DIR / "raw" / "raw.sqlite"))
+DEFAULT_LOCAL_DB = Path(os.environ.get("ONEPIECE_LOCAL_DB")
+                        or (DATA_DIR / "local.sqlite"))
 
 # ---------------------------------------------------------------------------
 # 建表语句
@@ -125,6 +121,20 @@ CREATE TABLE IF NOT EXISTS board_list (
     member_updated_at INTEGER            -- 成员上次同步时间 YYYYMMDD
 ) WITHOUT ROWID;
 
+-- 板块层级：东财的行业板块其实用的是**申万分类**（一级/二级/三级混在一张扁平表里），
+-- 层级从申万公开的分类表拿（见 datasource/board_tree.py），这里只存结果。
+CREATE TABLE IF NOT EXISTS board_tree (
+    concept     TEXT PRIMARY KEY,     -- BK1201
+    name        TEXT,                 -- 东财用的名字（可能带 Ⅱ/Ⅲ 后缀）
+    level       INTEGER,              -- 1 / 2 / 3
+    parent      TEXT,                 -- 上级板块代码；一级为 NULL
+    sw_code     TEXT,                 -- 申万行业代码（801080.SI），对不上就是 NULL
+    updated_at  INTEGER
+) WITHOUT ROWID;
+
+-- 按层级筛（「只看二级板块」）/ 按上级找子板块
+CREATE INDEX IF NOT EXISTS idx_board_tree_parent ON board_tree(parent);
+
 -- 板块成员：快照式（只有「现在有哪些」，没有 start/end 日期）
 CREATE TABLE IF NOT EXISTS concept_member (
     concept TEXT NOT NULL,
@@ -161,6 +171,7 @@ RAW_TABLE_COLS: dict[str, tuple] = {
                     "turnover_pct", "total_mv", "float_mv", "pe",
                     "volume_ratio", "pb", "chg_60d", "chg_ytd", "quote_time"),
     "board_list": ("concept", "name", "member_updated_at"),
+    "board_tree": ("concept", "name", "level", "parent", "sw_code", "updated_at"),
     "concept_member": ("concept", "code"),
 }
 
@@ -176,10 +187,10 @@ WATCH_KINDS = ("board", "stock")
 # ---------------------------------------------------------------------------
 
 def today_int() -> int:
-    """今天的 YYYYMMDD（北京时区）。
+    """
+    今天的 YYYYMMDD（北京时区）。
 
-    只用于「什么时候加入自选」这种时间戳，不参与任何交易日的判断 ——
-    数据入库永远以行情自带的交易日为准。
+    只用于「什么时候加入自选」这类时间戳，不参与交易日判断 —— 数据永远以行情自带的交易日为准。
     """
     return int(datetime.now(BEIJING).strftime("%Y%m%d"))
 
@@ -257,15 +268,14 @@ class SqliteDB:
         return cleaned
 
     def _verify_schema(self) -> list[str]:
-        """校对已存在的表结构和代码定义，返回被重建的表名。
+        """
+        校对已存在的表结构和代码定义，返回被重建的表名。
 
-        ⚠️ `CREATE TABLE IF NOT EXISTS` **不会**修改已存在的表结构 ——
-        所以改了 schema 之后，旧库会**静默地少一列**，属于最难查的那类错误。
-
-        处理规则：
-          · 缺列 + 表是空的   -> 重建（没数据可丢）
-          · 缺列 + 表有数据   -> **直接报错**，绝不自动删你的数据
-          · 多列 + 整列全是 NULL -> 删掉这一列（它没携带任何信息，删了绝对安全）
+        ⚠️ `CREATE TABLE IF NOT EXISTS` **不会**修改已存在的表结构 —— 改了 schema 之后
+        旧库会**静默地少一列**，属于最难查的那类错误。处理规则：
+            缺列 + 表是空的      -> 重建（没数据可丢）
+            缺列 + 表有数据      -> **直接报错**，绝不自动删你的数据
+            多列 + 整列全是 NULL -> 删掉这一列（它没携带任何信息）
         """
         rebuilt = []
         for table, cols in self.TABLE_COLS.items():
@@ -297,10 +307,8 @@ class SqliteDB:
         return self.conn.execute(sql, params).fetchall()
 
     def _insert(self, table: str, cols: tuple, rows: list[dict]) -> int:
-        """批量插入，**一个事务**（否则一行一个事务会慢上百倍）。
-
-        用 INSERT OR IGNORE：同一条已经存过就不覆盖，
-        语义就是「同一交易日不覆盖」：先到的算数，后来的不覆盖。
+        """
+        批量插入，**一个事务**（一行一个事务会慢上百倍）。用 INSERT OR IGNORE：同一条不覆盖。
         """
         if not rows:
             return 0
@@ -397,22 +405,21 @@ class Store(SqliteDB):
 
     # -- 读：个股日线 -----------------------------------------------------
     def stock_day_counts(self) -> dict[int, int]:
-        """每个交易日已经有多少行（YYYYMMDD -> 行数）。
+        """
+        每个交易日已经有多少行（YYYYMMDD -> 行数）。
 
-        一次查询同时回答两件事：
-          · 这天有没有（在不在字典里）= 「要不要再去拉」；
-          · 这天是不是只存了一半（行数明显少于全市场）= 「要不要重拉」。
+        一次查询同时回答：这天有没有（要不要去拉）、这天是不是只存了一半（要不要重拉）。
         """
         rows = self.query("SELECT trade_date, COUNT(*) AS n FROM stock_daily "
                           "GROUP BY trade_date")
         return {r["trade_date"]: r["n"] for r in rows}
 
     def last_trade_day(self) -> int | None:
-        """全市场日线覆盖到的最后一天（没有就是 None）。
+        """
+        全市场日线覆盖到的最后一天 —— 整个系统的**交易日钟**。
 
-        ★ 这就是整个系统的**交易日钟**：每天 fetch market 一次，其余一切以它为准。
-        有了它，「本地是不是最新的」不用去猜「今天是哪天、今天是不是交易日」——
-        那种判断在节假日一定会算错，而这种永远不会。
+        有了它，「本地是不是最新的」不用去猜「今天是哪天、今天是不是交易日」：
+        那种判断在节假日一定算错，而「全市场日线到哪天了」是既成事实。
         """
         return self.query("SELECT MAX(trade_date) AS d FROM stock_daily")[0]["d"]
 
@@ -425,9 +432,10 @@ class Store(SqliteDB):
 
     # -- 删：某个交易日的全市场数据（--force 重拉时才用）------------------
     def delete_stock_days(self, days) -> int:
-        """删掉这些交易日的个股日线，返回删掉的行数。
+        """
+        删掉这些交易日的个股日线，返回删掉的行数。
 
-        只在「这天没取全、要重拉」时用：因为写入一律 INSERT OR IGNORE，
+        只在「这天没取全、要重拉」时用：写入一律 INSERT OR IGNORE，
         不先删旧数据的话，重拉也盖不掉已经写进去的错行。
         """
         ds = [d for d in (date_to_int(x) for x in days) if d is not None]
@@ -455,6 +463,25 @@ class Store(SqliteDB):
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY code, trade_date"
         return [dict(r) for r in self.query(sql, params)]
+
+    # -- 删：整个板块（它的行情 + 成员 + 字典那行）-------------------------
+    def drop_board(self, concept: str) -> dict[str, int]:
+        """
+        把一个板块的本地数据**整个删掉**（board_daily + concept_member + board_list）。
+
+        只删行情会留下「字典有、成员有、但没行情」的半截状态，
+        下次 fetch board 还会把它当成「在跟的板块」又刷一遍。
+        ⚠️ 删掉的是历史，要拿回来得重新 fetch + update member。
+        """
+        concept = str(concept).strip().upper()
+        out = {}
+        with self.conn:
+            for table, col in (("board_daily", "concept"),
+                               ("concept_member", "concept"),
+                               ("board_list", "concept")):
+                cur = self.conn.execute(f"DELETE FROM {table} WHERE {col} = ?", (concept,))
+                out[table] = cur.rowcount
+        return out
 
     # -- 读：板块日线 -----------------------------------------------------
     def load_board_daily(self, concept: str, days: int | None = None) -> list[dict]:
@@ -484,6 +511,49 @@ class Store(SqliteDB):
         rows = self.query("SELECT name FROM board_list WHERE concept = ?",
                           (str(code).strip().upper(),))
         return rows[0]["name"] if rows else None
+
+    def delete_board_list(self, concepts: list[str]) -> int:
+        """只删板块字典里的条目（**不碰** board_daily / concept_member）。"""
+        if not concepts:
+            return 0
+        with self.conn:
+            cur = self.conn.executemany("DELETE FROM board_list WHERE concept = ?",
+                                        [(c,) for c in concepts])
+        return cur.rowcount
+
+    # -- 板块层级 ---------------------------------------------------------
+    def save_board_tree(self, nodes: list[dict], updated_at=None) -> int:
+        """整块重建板块层级（先清空再写）：这棵树是**快照**，不是逐条累积。"""
+        if not nodes:
+            return 0
+        at = date_to_int(updated_at) if updated_at else today_int()
+        cols = self.TABLE_COLS["board_tree"]
+        rows = [{**n, "updated_at": at} for n in nodes]
+        with self.conn:
+            self.conn.execute("DELETE FROM board_tree")
+            self.conn.executemany(
+                f"INSERT OR REPLACE INTO board_tree ({','.join(cols)}) "
+                f"VALUES ({','.join('?' * len(cols))})",
+                [tuple(r.get(c) for c in cols) for r in rows])
+        return len(rows)
+
+    def load_board_tree(self) -> list[dict]:
+        """整棵树（按层级、代码排序）。"""
+        return [dict(r) for r in self.query(
+            "SELECT * FROM board_tree ORDER BY level, concept")]
+
+    def board_level(self, concept: str) -> int | None:
+        got = self.query("SELECT level FROM board_tree WHERE concept = ?",
+                         (str(concept).strip().upper(),))
+        return got[0]["level"] if got else None
+
+    def child_boards(self, concept: str, level: int | None = None) -> list[dict]:
+        """某个板块下辖的板块（level 给了就只看那一层）。"""
+        sql = "SELECT * FROM board_tree WHERE parent = ?"
+        params = [str(concept).strip().upper()]
+        if level is not None:
+            sql += " AND level = ?"; params.append(level)
+        return [dict(r) for r in self.query(sql + " ORDER BY level, concept", params)]
 
     # -- 读：板块字典 / 成员 ----------------------------------------------
     def load_board_list(self) -> list[dict]:

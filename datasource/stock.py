@@ -3,17 +3,12 @@
 """
 stock.py —— 个股数据封装接口（内部调用 fetch.py）。
 
-    from datasource.stock import Stocks
     s = Stocks()
-    s.fetch("300308")             -> FetchResult  最新一天（走 tushare）
-    s.fetch("300308", days=15)    -> FetchResult  最近 15 个交易日（走 tushare）
-    s.get("300308")               -> dict         最新一天本身
-    s.history("300308", days=15)  -> list[dict]   本地已存的（不联网）
-    s.cached_codes()              -> list[str]    本地已缓存了哪些个股
+    s.fetch("300308")            -> FetchResult   联网拉取并入库
+    s.history("300308", days=15) -> list[dict]    读本地（不联网）
 
 用哪个数据源由 config/system.yaml 的 stock 决定（默认 tushare）。
-
-后续其他功能（指标、策略等）统一从这里拿个股数据，不要直接碰具体数据源。
+后续其他功能统一从这里拿个股数据，不要直接碰具体数据源。
 """
 
 from __future__ import annotations

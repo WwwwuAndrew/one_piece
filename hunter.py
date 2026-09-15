@@ -2,61 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 hunter.py —— 整个项目唯一的执行入口。
-
-用法：
-    # 拉取（并入库）板块 / 个股
-    python3 hunter.py fetch market                 # ★ 全市场日线入库（1 个请求）
-    python3 hunter.py fetch market --date 20260911 # 指定交易日
-    python3 hunter.py fetch BK1201                 # 板块当天快照（direct）
-    python3 hunter.py fetch 300308                 # 个股最新一天（tushare）
-    python3 hunter.py fetch BK1201 --days 15       # 板块最近 15 个交易日（akshare）
-    python3 hunter.py fetch 300308 --days 15       # 个股最近 15 个交易日（tushare）
-    python3 hunter.py fetch BK1201 300308          # 一次拉多个
-
-    # 批量：把本地已缓存过的板块全部刷一遍最新（两个之间会自动间隔，避免被反爬）
-    python3 hunter.py fetch board
-
-    # 补历史空档（新装时跑一次；一天 1 个请求，本地已有的自动跳过、可中断续跑）
-    python3 hunter.py backfill market --days 30    # 最近 30 个交易日的全市场日线
-    python3 hunter.py backfill market --days 30 --force   # 已有的也重拉（修没取全的天）
-
-    # 自选：关注不过来那么多板块，看到感兴趣的加进来，势能走完再移出去
-    python3 hunter.py watch BK1201 300308          # 加入自选（纯本地，不联网）
-    python3 hunter.py watch                        # 看当前自选
-    python3 hunter.py unwatch BK1201               # 移出自选（纯本地）
-
-    # 关键字 watch：只对「自选里的标的」做同一件事
-    python3 hunter.py fetch watch                  # 刷自选（已是最新的跳过，0 请求）
-    python3 hunter.py fetch watch --days 15        # 拉自选的最近 15 个交易日
-    python3 hunter.py show watch                   # 只看自选
-    python3 hunter.py update member watch          # 只同步自选里板块的成分股
-
-    # 同步「定义类」数据 —— 都不常做（只在上市/改名/换成分股时才需要）
-    python3 hunter.py update member BK1201         # 一个板块的成分股（走东财，分页拉）
-    python3 hunter.py update member all            # ★ 库里所有板块，带防反爬 + 可续跑
-    python3 hunter.py update stock                 # 个股字典：代码→名字（1 个请求）
-
-    # 展示本地已存的最近 N 天数据（默认 15 天，浏览器图形化表格 + 柱状图）
-    python3 hunter.py show BK1201
-    python3 hunter.py show 300308 --days 30
-    python3 hunter.py show BK1201 300308 BK1036
-    python3 hunter.py show board                 # 展示本地已缓存的所有板块
-
-说明：
-    watch    = 自选（存 data/local.sqlite，**不可重建**所以单独一个文件）。
-               板块和个股共用一张表；watch / unwatch 只改本地状态，不联网。
-               fetch / update / show 都认关键字 watch = 只操作自选里的标的。
-    fetch    = 数据获取主接口（datasource/fetch.py）：按 config/system.yaml 配的
-               数据源联网拉取，再按交易日与本地比对，缺了才入库（data/raw/raw.sqlite）。
-               fetch market 入 stock_daily；fetch 板块入 board_daily。
-               ★ fetch board / fetch watch 会先看本地是不是已经到「最新交易日」了，
-                 是就跳过、一个请求都不发（判据见 Fetcher.is_up_to_date）；加 --force 可强制重拉。
-    backfill = 补历史空档：按交易日逐天往前拉（fetch 只管最新那一天）。
-    update   = 更新「定义类」数据（都不常做）：
-               update member <代码|all>  板块成分股，走东财（all = 库里所有板块）
-               update stock              个股字典（代码→名字），Tushare 1 个请求拿全市场
-    show     = 只读本地数据库，渲染成图形化页面（成交额/涨跌幅柱状图 + 明细表）
-               并在浏览器打开，不联网。
 """
 
 from __future__ import annotations
@@ -81,7 +26,6 @@ def _print_result(result) -> None:
     rec = result.fetched[-1]
     name = rec.get("name") or ""
     if len(result.fetched) == 1:
-        # 只要最新一条：直接展示快照
         show_data.print_snapshot(rec)
         return
     first = date_to_str(result.fetched[0].get("trade_date"))
@@ -92,18 +36,15 @@ def _print_result(result) -> None:
 
 def _split_fresh(fetcher: Fetcher, codes: list[str], days: int | None,
                  force: bool) -> tuple[list[str], list[str], int | None]:
-    """把这批代码分成 (需要拉的, 本地已经是最新的)。
+    """
+    把代码分成 (需要拉的, 本地已经是最新的)。
 
-    「已经是最新」= 本地数据 >= 全市场日线覆盖到的最后一天（交易日钟）。
-    没联网、没猜「今天是哪天」—— 详见 Fetcher.is_up_to_date。
-
-    只在「只要最新」时跳过（days 为空）：给了 --days N 说明你就是要历史，
-    那就老老实实去拉，别自作聪明。
+    判据是「本地最后一天 >= 交易日钟」，不猜今天几号，详见 Fetcher.is_up_to_date。
+    给了 --days 说明你要的是历史，那就不跳过。
     """
     if force or days is not None:
         return list(codes), [], None
-    # 交易日钟从**这个 fetcher 自己的库**取（不要去摸模块级的 store ——
-    # 生产和测试里看着一样，但那是巧合，层级上 hunter 不该替 fetch 决定读哪个库）
+    # 交易日钟要从**这个 fetcher 自己的库**取，别去摸模块级的 store
     ref = fetcher.db.last_trade_day()     # 一批只查一次
     todo, fresh = [], []
     for c in codes:
@@ -128,9 +69,8 @@ def _report_plan(label: str, todo: list[str], fresh: list[str],
 
 def _fetch_batch(fetcher: Fetcher, boxes, codes: list[str], days: int | None,
                  force: bool = False, label: str = "") -> int:
-    """批量刷一批标的：本地已是最新的跳过，其余逐个拉（带间隔）。
-
-    fetch board 和 fetch watch 共用这一套 —— 这样「跳过」的规则只有一份，不会走岔。
+    """
+    批量刷一批标的：本地已是最新的跳过，其余逐个拉（带间隔）。fetch board / fetch watch 共用。
     """
     if not codes:
         return 1
@@ -166,15 +106,43 @@ def _fetch_batch(fetcher: Fetcher, boxes, codes: list[str], days: int | None,
     return rc if rc else (0 if ok == len(todo) else 1)
 
 
+def _boards_by_level(level: int) -> list[str]:
+    """层级表里某一级的板块代码（一级 31 个 / 二级 128 个）。"""
+    return [r["concept"] for r in store.query(
+        "SELECT concept FROM board_tree WHERE level = ? ORDER BY concept", (level,))]
+
+
 def _fetch_all_boards(fetcher: Fetcher, boxes, days: int | None,
-                      force: bool = False) -> int:
-    """fetch board —— 把本地已有数据的板块都刷一遍最新。"""
-    codes = boxes[0].cached_codes()
-    if not codes:
-        print("⚠️  本地还没有任何板块数据。先拉一个具体的，例如：")
-        print("      python3 hunter.py fetch BK1201")
+                      force: bool = False, level: int | None = None) -> int:
+    """
+    fetch board —— 一级和二级板块的行情一起更新（31 + 128 个，每个 1 个请求）。
+
+    本地已经有当天的会跳过；--level 1 / 2 可以只刷一层。
+    """
+    lv1, lv2 = _boards_by_level(1), _boards_by_level(2)
+    if not lv1 and not lv2:
+        print("⚠️  还没有板块层级表。先跑一次（东财 5 + 乐咕 3 个请求）：")
+        print("      python3 hunter.py update tree")
         return 1
-    return _fetch_batch(fetcher, boxes, codes, days, force, label="本地已有的板块 ")
+
+    if level == 2:
+        codes = lv2
+    elif level == 1:
+        codes = lv1
+    else:
+        codes = lv1 + lv2          # 一级在前，二级在后（报告看起来是分组的）
+    if not codes:
+        print(f"⚠️  层级表里没有 {level} 级的板块")
+        return 1
+
+    if days:
+        print("⚠️  fetch board 是批量刷最新快照，忽略 --days")
+
+    rc = _fetch_batch(fetcher, boxes, codes, days, force,
+                      label=f"板块（一级 {len(lv1)} + 二级 {len(lv2)}）")
+    if rc == 0:
+        _print_board_state()
+    return rc
 
 
 def _print_db_state() -> None:
@@ -189,11 +157,8 @@ def _print_db_state() -> None:
 
 
 def _print_day_health() -> None:
-    """库内体检：每个交易日的行数都该接近「全市场只数」。
-
-    明显偏少 = 那天没取全（接口截断 / 数据还没跑完就拉了）。
-    行数只增不减（上市公司只会越来越多），所以「比最多的那天少 5% 以上」
-    基本只有一个解释：那天缺数据。（30 个交易日里不可能新上市 270 只。）
+    """
+    体检：每个交易日的行数都该接近全市场只数，明显偏少就是那天没取全。
     """
     rows = store.query("SELECT trade_date, COUNT(*) AS n FROM stock_daily "
                        "GROUP BY trade_date ORDER BY trade_date")
@@ -222,10 +187,10 @@ def _fmt_eta(n: int, interval: float) -> str:
 
 
 def _fetch_market(fetcher: Fetcher, trade_date: str | None) -> int:
-    """fetch market —— 拉**一天**的全市场日线入库。1 个请求，约 5400 只。
+    """
+    fetch market —— 拉**一天**的全市场日线入库（1 个请求，约 5500 只）。
 
-    这是整套架构的地基：行情只拉一次，之后所有板块计算都在本地做。
-    本地已经有的交易日不会重复拉（要重拉用 backfill --force）。
+    这是整套架构的地基，同时是全系统的「交易日钟」：其余「本地是不是最新」都以它为准。
     """
     print("拉全市场日线（1 个请求）…")
     try:
@@ -255,13 +220,10 @@ def _fetch_market(fetcher: Fetcher, trade_date: str | None) -> int:
 
 def _backfill_market(fetcher: Fetcher, days: int,
                      end: str | None = None, force: bool = False) -> int:
-    """backfill market --days N —— 把最近 N 个交易日的全市场日线补齐。
+    """
+    backfill market --days N —— 补最近 N 个交易日的全市场日线。
 
-    一次性动作：新装、或想回看更早的行情时跑一次；
-    之后每天只要 fetch market 补当天那一根就够了。
-
-    · 一天 1 个请求，**本地已有的不重复拉** -> 中途 Ctrl-C，重跑会接着补，不白费请求；
-    · 请求之间按 config 的 fetch_interval 间隔（tushare 120 积分限 50 次/分钟）。
+    一天 1 个请求，本地已有的不重复拉，所以 Ctrl-C 之后重跑会接着补。
     """
     try:
         plan = fetcher.market_plan(days, end=end)
@@ -302,8 +264,7 @@ def _backfill_market(fetcher: Fetcher, days: int,
             r = fetcher.market(p["day"], force=force)
         except Exception as exc:
             failed += 1
-            # 走 stdout：这行是**进度**的一部分（否则日志里编号会缺一块，看着像 bug）。
-            # 整个命令直接失败（比如 token 不对）才走 stderr。
+            # 走 stdout：它是进度的一部分（日志里编号不能缺一块）
             print(f"  [{i}/{len(todo)}] ❌ {p['day']}  {exc}")
             continue
 
@@ -432,7 +393,7 @@ def cmd_watchlist() -> int:
         print(f"  [{title}]")
         for w in group:
             name = w["name"] or store.name_of(w["kind"], w["code"]) or "—"
-            # 有没有本地数据，一眼能看出来（省得你去猜为什么 show 是空的）
+            # 有没有本地数据，一眼看出来
             n = len(Fetcher(db=store).load(w["code"]))
             mark = f"{n} 个交易日" if n else "⚠️ 本地还没有数据"
             note = f"   {w['note']}" if w["note"] else ""
@@ -452,9 +413,8 @@ def _fetch_one(boxes, code: str, days: int | None):
 
 def _fetch_watch(fetcher: Fetcher, boxes, days: int | None,
                  force: bool = False) -> int:
-    """fetch watch —— 把**自选里的**标的各刷一遍最新（本地已有当天数据的跳过）。
-
-    自选通常只有几个，所以这个命令很轻；想全刷板块用 fetch board。
+    """
+    fetch watch —— 只刷自选里的标的。
     """
     codes = watched_codes()
     if not codes:
@@ -465,8 +425,7 @@ def _fetch_watch(fetcher: Fetcher, boxes, days: int | None,
 
 def cmd_fetch(codes: list[str], days: int | None,
               trade_date: str | None = None, force: bool = False) -> int:
-    # 一个命令里只用一套 Fetcher / Boards / Stocks：
-    # 这样数据源实例是复用的（DirectSource 的连接池才有效）。
+    # 一个命令里只用一套 Fetcher（数据源实例复用，连接池才有效）
     fetcher = Fetcher()
     boards = Boards(fetcher)
     stocks = Stocks(fetcher)
@@ -497,14 +456,8 @@ def cmd_fetch(codes: list[str], days: int | None,
 
 
 def _member_sync(code: str, src: DirectSource, now: int, brief: bool = False) -> dict:
-    """同步一个板块的成分股，返回 {"code","name","total","added","removed"}。
-
-    做三件事：
-      1. 拉成分股（分页，成员数 ÷ 100 个请求）
-      2. 整块替换 concept_member（删掉的去除、新增的加上）
-      3. 记下同步时间（+ 板块名，只在本地没有名字时才花那 1 个请求）
-
-    失败就抛出来，由调用方决定「继续下一个」还是「赶紧停」。
+    """
+    同步一个板块的成分股并写库。失败就抛出来，由调用方决定继续还是停。
     """
     old = set(store.load_board_members(code))
     members = src.fetch_board_members(code)          # 分页拉，可能好几个请求
@@ -535,7 +488,9 @@ def _member_sync(code: str, src: DirectSource, now: int, brief: bool = False) ->
 
 
 def _update_member(code: str) -> int:
-    """update member BK1201 —— 同步**一个**板块的成分股名单。"""
+    """
+    update member BK1201 —— 同步**一个**板块的成分股名单。
+    """
     code = code.strip().upper()
     if not is_board_code(code):
         print(f"\n❌ 板块代码应形如 BK1201，收到：{code}", file=sys.stderr)
@@ -585,19 +540,24 @@ def _looks_blocked(exc: Exception) -> bool:
 
 
 def _all_board_codes() -> list[str]:
-    """库里「相关的」板块 = 有行情的（board_daily）∪ 字典里的（board_list）。
+    """
+    「我在跟的板块」= 有行情的 ∪ 有成分股的 ∪ 自选里的。
 
-    前者 = 你抓过数据的，后者 = 你同步过成员 / 手动登记过的，合起来才是「我在跟的板块」。
+    故意**不含** board_list 里纯粹是字典条目的板块 —— update tree 会把 159 个都写进字典，
+    要是都算成「在跟的」，update member all 一下就成了上百个请求。
     """
     rows = store.query("SELECT concept FROM board_daily "
-                       "UNION SELECT concept FROM board_list ORDER BY concept")
-    return [r["concept"] for r in rows]
+                       "UNION SELECT concept FROM concept_member ORDER BY concept")
+    codes = [r["concept"] for r in rows]
+    for c in watched_codes("board"):
+        if c not in codes:
+            codes.append(c)
+    return sorted(codes)
 
 
 def _update_member_watch(force: bool = False) -> int:
-    """update member watch —— 只同步**自选里那些板块**的成分股。
-
-    自选里的个股会被自动忽略（个股没有「成分股」这回事）。
+    """
+    update member watch —— 只同步自选里那些板块的成分股（个股没有成分股，忽略）。
     """
     codes = [c for c in watched_codes("board")]
     if not codes:
@@ -607,19 +567,11 @@ def _update_member_watch(force: bool = False) -> int:
 
 
 def _update_member_all(force: bool = False) -> int:
-    """update member all —— 把库里**所有相关板块**的成分股都同步一遍。
+    """
+    update member all —— 同步库里所有相关板块的成分股。
 
-    ★ 防反爬（这个命令是整套系统里请求最多的，必须小心）：
-
-      1. **板块之间按 config 的 fetch_interval 间隔**（默认 2 秒），不连着打；
-      2. **今天已经同步过的直接跳过** —— 成分股很少变（一个月才动几只），
-         没必要天天重拉；顺带让这个命令**可以中断续跑**：Ctrl-C 之后重跑，
-         同步好的会跳过，不会从头再来一遍；
-      3. **一旦被拒（RemoteDisconnected 之类）立刻停下**，不再往下敲 ——
-         继续敲只会让 IP 被锁更久。宁可只同步一半，也别把路走死。
-
-    请求量：每个板块 = 成员数 ÷ 100 向上取整（东财单页上限 100），
-    本地有名字就不再花那 1 个请求。21 个板块大约 60 个请求 / 2 分钟。
+    防反爬：板块之间按 fetch_interval 间隔；今天同步过的跳过（顺带可中断续跑）；
+    一旦被拒立刻停下 —— 继续敲只会让 IP 被锁更久。
     """
     return _sync_members(_all_board_codes(), force=force)
 
@@ -678,7 +630,7 @@ def _sync_members(codes: list[str], force: bool = False) -> int:
     print(f"\n完成：{done}/{len(todo)} 个板块"
           + (f"，{failed} 个失败" if failed else "")
           + f"；共 {members_total:,} 条成员关系")
-    # 请求数只有 DirectSource 记（别的数据源没有计数器，就不报这一句）
+    # 请求数只有 DirectSource 记，没有就不报这一句
     made = getattr(src, "requests_made", 0)
     print(f"   用了 {cost:.0f} 秒" + (f" / {made} 个请求" if made else "")
           + (f"（平均 {cost / made:.1f} 秒一个）" if made else ""))
@@ -696,11 +648,10 @@ def _print_member_state() -> None:
 
 
 def _update_stock_list() -> int:
-    """update stock —— 同步「个股字典」（代码 → 名字）。**1 个请求**，约 5500 只。
+    """
+    update stock —— 同步个股字典（代码 → 名字），1 个请求拿全市场。
 
-    为什么单独做一次：名字属于「字典」不属于行情，每天那份全市场日线里没有名字；
-    而按只去查名字要 5500 个请求，一次拉全量只要 1 个。
-    同步一次能用很久（只在上市 / 改名 / 退市时才需要再拉）。
+    名字属于字典不属于行情：按只查要 5500 个请求，一次拉全量只要 1 个。
     """
     try:
         src = TushareSource()
@@ -738,12 +689,57 @@ def _update_stock_list() -> int:
     return 0
 
 
+def _update_tree() -> int:
+    """
+    update tree —— 重建一级/二级板块表，并清掉字典里不属于这两级的多余条目。
+
+    层级来自申万分类（东财接口不给层级），东财只用来拉板块字典。
+    详见 datasource/board_tree.py。
+    """
+    from datasource.board_tree import BoardTree, prune_dict, used_boards
+
+    tree = BoardTree()
+    print("重建板块层级 …")
+    try:
+        res = tree.build()
+    except Exception as exc:
+        print(f"\n❌ {exc}", file=sys.stderr)
+        return 1
+
+    if not res.nodes:
+        print("❌ 一个节点都没建出来，先看看上面的报错", file=sys.stderr)
+        return 1
+
+    n = tree.save(res)
+    counts = res.counts
+    print(f"\n✅ 一级/二级板块表已入库：{n} 个"
+          f"（一级 {counts.get(1, 0)} / 二级 {counts.get(2, 0)}）")
+
+    keep = {x.bk for x in res.nodes}
+    protected = used_boards(store) | set(watched_codes("board"))
+    dropped = prune_dict(store, keep, protected)
+    if dropped:
+        print(f"   板块字典清掉 {len(dropped)} 个不属于一级/二级的条目"
+              f"（三级板块那些；行情和成分股都没动）")
+    kept = sorted(protected - keep)
+    if kept:
+        print(f"   有 {len(kept)} 个不在层级里、但你抓过数据 —— 保留了："
+              + "、".join(kept[:8]))
+        print("      要连数据一起删：python3 hunter.py drop board " + " ".join(kept[:3]))
+
+    print(f"\n   fetch board 现在会更新这 {n} 个板块（一级在前、二级在后）")
+    print("   show board 会按一级分标签，每个一级下面依次列出它的二级")
+    return 0
+
+
 def cmd_update(what: str, codes: list[str], force: bool = False) -> int:
     """update member <codes|all> / update stock。"""
     if what == "stock":
         return _update_stock_list()
+    if what == "tree":
+        return _update_tree()
     if what != "member":
-        print(f"\n❌ 暂不支持 update {what}（只有 member / stock）", file=sys.stderr)
+        print(f"\n❌ 暂不支持 update {what}（只有 member / stock / tree）", file=sys.stderr)
         return 1
     if not codes:
         print("\n❌ update member 要跟板块代码或 all，例如：\n"
@@ -751,7 +747,6 @@ def cmd_update(what: str, codes: list[str], force: bool = False) -> int:
               "      python3 hunter.py update member all", file=sys.stderr)
         return 1
 
-    # all：把库里所有相关板块（有行情 ∪ 在字典里）都同步一遍
     if any(c.strip().lower() == "all" for c in codes):
         if len(codes) > 1:
             print("⚠️  给了 all 就忽略其它代码了")
@@ -779,31 +774,103 @@ def _print_board_state() -> None:
           f"（{date_to_str(r['a'])} ~ {date_to_str(r['b'])}）")
 
 
+def cmd_drop(what: str, codes: list[str]) -> int:
+    """
+    drop board <代码…> —— 删掉板块的本地数据（行情 + 成分股 + 字典那行）。
+
+    和 unwatch 不是一回事：unwatch 只是不再关注，数据留着。
+    个股没有 drop —— 它的行情是全市场一次拉进来的，删了明天也会回来。
+    """
+    if what != "board":
+        print(f"❌ drop 只支持 board（个股行情是全市场一次拉的，删了也会回来；"
+              f"不想要就 unwatch）", file=sys.stderr)
+        return 1
+    if not codes:
+        print("❌ drop board 要跟板块代码，例如：python3 hunter.py drop board BK1201",
+              file=sys.stderr)
+        return 1
+
+    # ⚠️ 用 hunter.Fetcher 造 Boards，别写 Boards() —— 那会用 datasource.boards
+    #    里 import 进去的 Fetcher（真实库）。全部经由 hunter.Fetcher，「换掉它」才有唯一口子。
+    boards = Boards(Fetcher())
+    watched = set(watched_codes("board"))
+    rc = 0
+    for raw in codes:
+        code = raw.strip().upper()
+        if not is_board_code(code):
+            print(f"❌ 板块代码应形如 BK1201，收到：{raw.strip()}", file=sys.stderr)
+            rc = 1
+            continue
+
+        before = boards.what_would_drop(code)
+        if not any(before.values()):
+            print(f"· 本地本来就没有 {code} 的任何数据")
+            continue
+
+        label = _label("board", code)
+        print(f"删除 {label}：")
+        print(f"    行情 {before['board_daily']} 个交易日"
+              f" / 成员 {before['concept_member']} 只"
+              + ("  / 板块字典那行" if before["board_list"] else ""))
+        gone = boards.drop(code)
+        print(f"  ✅ 已删（board_daily {gone['board_daily']} 行，"
+              f"concept_member {gone['concept_member']} 行，"
+              f"board_list {gone['board_list']} 行）")
+        if code in watched:
+            print(f"  ⚠️  它还在自选里 —— 数据没了但标记还在。要一起清掉："
+                  f"python3 hunter.py unwatch {code}")
+        print(f"  拿回来：python3 hunter.py fetch {code} --days 20"
+              f" + python3 hunter.py update member {code}")
+    if rc == 0 and codes:
+        _print_board_state()
+    return rc
+
+
+def _board_groups() -> list[tuple[str, list[str]]]:
+    """[(一级代码, [二级代码…]), …] —— 从层级表来。"""
+    rows = store.load_board_tree()
+    kids: dict[str, list[str]] = {}
+    for r in rows:
+        if r["parent"]:
+            kids.setdefault(r["parent"], []).append(r["concept"])
+    return [(r["concept"], sorted(kids.get(r["concept"], [])))
+            for r in rows if r["level"] == 1]
+
+
 def cmd_show(codes: list[str], days: int) -> int:
-    # 关键字 board：把本地已缓存的所有板块一起展示出来
+    """show —— board = 一级分标签（下面排二级）；watch = 只看自选；也可以给具体代码。"""
     expanded: list[str] = []
+    want_grouped = False
     for raw in codes:
         c = raw.strip()
-        if c.lower() == "watch":
+        if c.lower() == "board":
+            want_grouped = True
+        elif c.lower() == "watch":
             w = watched_codes()
             if not w:
                 print("⚠️  自选是空的。先加一个：python3 hunter.py watch BK1201")
                 return 1
             print(f"自选 {len(w)} 个，全部展示：" + ", ".join(w))
             expanded.extend(w)
-        elif c.lower() == "board":
-            cached = Fetcher().cached_codes("board")
-            if not cached:
-                print("⚠️  本地还没有任何板块数据。先拉一个，例如：")
-                print("      python3 hunter.py fetch BK1201")
-                return 1
-            print(f"本地已缓存 {len(cached)} 个板块，全部展示：{', '.join(cached)}")
-            expanded.extend(cached)
-        else:
+        elif is_board_code(c) or (c.isdigit() and len(c) == 6):
             expanded.append(c)
+        else:
+            print(f"❌ 认不出的写法：{c}（板块形如 BK1201，个股形如 300308，"
+                  f"或关键字 board / watch）", file=sys.stderr)
+            return 1
 
     try:
-        show_data.gui(expanded, days=days)
+        if want_grouped:
+            groups = _board_groups()
+            if not groups:
+                print("⚠️  还没有一级/二级板块表。先跑一次：")
+                print("      python3 hunter.py update tree")
+                return 1
+            n2 = sum(len(k) for _, k in groups)
+            print(f"一级 {len(groups)} 个标签，每个下面排它自己的二级（共 {n2} 个）")
+            show_data.gui_grouped(groups, days=days)
+        if expanded:
+            show_data.gui(expanded, days=days)
         return 0
     except Exception as exc:
         print(f"\n❌ {exc}", file=sys.stderr)
@@ -815,23 +882,13 @@ def main() -> int:
         prog="hunter.py",
         description="去追寻资金的脚印吧",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="示例：\n"
-               "  python3 hunter.py fetch market           # ★ 全市场日线入库（1 个请求）\n"
-               "  python3 hunter.py fetch market --date 20260911\n"
-               "  python3 hunter.py fetch BK1201\n"
-               "  python3 hunter.py fetch 300308\n"
-               "  python3 hunter.py fetch BK1201 --days 15\n"
-               "  python3 hunter.py fetch 300308 --days 15\n"
-               "  python3 hunter.py fetch board            # 批量刷本地所有板块\n"
-               "  python3 hunter.py backfill market --days 30   # 补最近 30 个交易日\n"
-               "  python3 hunter.py watch BK1201 300308          # 加入自选\n"
-               "  python3 hunter.py fetch watch                  # 只刷自选\n"
-               "  python3 hunter.py show watch                   # 只看自选\n"
-               "  python3 hunter.py update member all            # 同步所有板块的成分股\n"
-               "  python3 hunter.py backfill market --days 1 --force  # 重拉最新那天\n"
-               "  python3 hunter.py show BK1201\n"
-               "  python3 hunter.py show 300308 --days 30\n"
-               "  python3 hunter.py show board             # 展示本地所有板块",
+        epilog="示例（完整用法见 README.md）：\n"
+               "  python3 hunter.py fetch market     # 每天收盘后：全市场日线\n"
+               "  python3 hunter.py fetch board      # 一级+二级板块行情\n"
+               "  python3 hunter.py update tree      # 建一级/二级板块表\n"
+               "  python3 hunter.py watch BK1036     # 加自选\n"
+               "  python3 hunter.py show board       # 一级分标签看行情\n"
+               "  python3 hunter.py show watch       # 只看自选",
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -861,6 +918,11 @@ def main() -> int:
     p_back.add_argument("--force", action="store_true",
                         help="本地已有的也重拉（先删后写），用来修「那天没取全」")
 
+    p_drop = sub.add_parser(
+        "drop", help="删掉某个板块的本地数据（行情 + 成分股 + 字典那行）")
+    p_drop.add_argument("what", choices=["board"], help="删什么：board = 板块")
+    p_drop.add_argument("codes", nargs="+", help="板块代码，如 BK1201（可给多个）")
+
     p_watch = sub.add_parser(
         "watch", help="加入自选（不给代码 = 看当前自选）；只改本地状态，不联网")
     p_watch.add_argument("codes", nargs="*",
@@ -872,8 +934,9 @@ def main() -> int:
     p_update = sub.add_parser(
         "update", help="更新本地缓存的「定义类」数据（板块成分股名单）")
     p_update.add_argument(
-        "what", choices=["member", "stock"],
-        help="更新什么：member = 板块成分股名单 / stock = 个股字典（代码→名字）")
+        "what", choices=["member", "stock", "tree"],
+        help="更新什么：member = 板块成分股 / stock = 个股字典 / tree = 一级二级板块表")
+
     p_update.add_argument("codes", nargs="*",
                           help="板块代码（如 BK1201），或关键字 all（库里所有板块）"
                                " / watch（只在自选里的板块）")
@@ -884,7 +947,8 @@ def main() -> int:
         "show", help="展示本地数据（成交额/涨跌幅柱状图 + 明细表，浏览器打开）")
     p_show.add_argument(
         "codes", nargs="+",
-        help="板块代码 / 个股代码 / 关键字 board（本地所有板块） / watch（自选）")
+        help="板块代码 / 个股代码 / 关键字 board（一级+二级，按一级分标签）"
+             " / watch（自选）")
     p_show.add_argument("--days", type=int, default=15, help="最近多少个交易日，默认 15")
 
     args = ap.parse_args()
@@ -893,6 +957,8 @@ def main() -> int:
         return cmd_fetch(args.codes, args.days, args.date, force=args.force)
     if args.cmd == "backfill":
         return _backfill_market(Fetcher(), args.days, end=args.end, force=args.force)
+    if args.cmd == "drop":
+        return cmd_drop(args.what, args.codes)
     if args.cmd == "watch":
         return cmd_watch(args.codes)
     if args.cmd == "unwatch":

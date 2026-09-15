@@ -1,34 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fetch_direct.py —— 直连东方财富「延时行情」的数据源（当天快照）。
+fetch_direct.py —— 东方财富延时行情数据源（板块快照 + 板块成分股）。
 
-    from datasource.fetch_direct import DirectSource
-    src = DirectSource()                          # 也可以注入自己的 session
-    src.fetch_board("BK1201")  -> list[dict]      板块当天快照（1 条）
-    src.fetch_stock("300308")  -> list[dict]      个股当天快照（1 条）
+    src = DirectSource()
+    src.fetch_board("BK1201")              # 板块当天快照
+    src.fetch_board_members("BK1201")      # 成分股名单（分页，约 6 个请求）
+    src.fetch_industry_boards()            # 全部行业板块（约 5 个请求）
 
-继承 datasource/base.py 的 DataSource；记录结构、方法契约见 base.py 的文档。
-**这个数据源只有「当天」**，要历史请用 akshare（板块）/ tushare（个股）。
+⚠️ 宿主是 **push2delay**（延时行情）那个集群：`push2` / `push2his` / `7.push2his` /
+   `29.push2` 这几个在本机是被拒的（RemoteDisconnected），别改回去。
+   `push2delay` 只服务 clist / ulist，**没有 kline** —— 所以板块历史走 akshare。
 
-（方法统一返回 list[dict]：当天就是 1 条，和别的数据源保持同一个契约，
- 这样 Fetcher 才能无差别地比对入库。）
+⚠️ 单页上限 100：传 pz=500 也只会返回 100 条，**必须翻页**，
+   而且拿不全要报错而不是静默少返回（`_clist` 里那条 total 检查就是干这个的）。
 
-为什么是延时行情集群 push2delay：
-    AKShare 的板块/个股接口固定访问 push2.eastmoney.com / push2his.eastmoney.com，
-    这两个域名在本机网络下会被服务器直接断开；push2delay.eastmoney.com 可正常访问。
-
-请求量（每个标的）：
-    板块当天：1 个请求。板块的 secid 前缀固定是 90（90.BK1201），直接精准取，
-              不遍历、不翻页。
-    个股当天：用代码推断市场号精确查询，最多 2 个请求（沪/深/北 需要猜一次）。
-    板块成分股：成员数 ÷ 100 向上取整（BK1201 有 521 只 -> 6 个请求）。
-              ⚠️ 所以只能「同步板块字典」时用，绝不能按板块逐个拉行情。
-
-设计约定：
-    **有状态的放类里**（连接、超时、重试、间隔 -> DirectSource）；
-    **无状态的纯转换保持函数**（原始行 -> 统一结构 _normalize）；
-    **全项目共用的纯函数放 base.py**（代码识别、to_num、日期窗口等）。
+限速：单个请求失败重试 2 次，请求之间隔 INTERVAL 秒；批量操作由调用方再拉开间隔。
 """
 
 from __future__ import annotations
@@ -163,10 +150,10 @@ def _normalize(row: dict, kind: str) -> dict:
 # ---------------------------------------------------------------------------
 
 class DirectSource(DataSource):
-    """东方财富延时行情数据源。
+    """
+    东方财富延时行情数据源（板块快照 / 成分股 / 板块清单）。
 
-    持有自己的 requests.Session：**连接复用**，不必每次请求都重新做
-    TCP + TLS 握手（更快，也更像正常浏览器，不容易被当成脚本）。
+    自带 requests.Session：连接复用，更快也更像正常浏览器。
     """
 
     # 入库时写进记录的 source 字段。**必须显式声明** ——
@@ -204,15 +191,13 @@ class DirectSource(DataSource):
                     time.sleep(2)
         raise RuntimeError(f"请求失败（已重试 {self.max_retry} 次）：{last_err}")
 
-    def _clist(self, fs: str, page_size: int = 100, max_pages: int = 12) -> list[dict]:
-        """取一个列表，按需翻页。
+    def _clist(self, fs: str, page_size: int = 100, max_pages: int = 12,
+               fields: str | None = None) -> list[dict]:
+        """
+        取一个列表，按需翻页。
 
-        目前 fetch_board 已改为精准查询（1 个请求），不再走这里；
-        保留它是为了以后「一次扫全部板块」的场景（板块相对强弱要用）。
-
-        ⚠️ 东方财富服务端**单页上限就是 100 条**（传 pz=500 也只会返回 100 条，
-        多余的被静默截断）。所以列表必须翻页，否则会悄悄少拿数据。
-        行业板块共 496 个 -> 5 页。
+        ⚠️ 东财服务端**单页上限就是 100**（传 pz=500 也只返回 100 条，多的被静默截断），
+        所以必须翻页；拿不全就报错，不能悄悄少返回。
         """
         rows: list[dict] = []
         total = None
@@ -221,7 +206,8 @@ class DirectSource(DataSource):
                 time.sleep(self.interval)
             payload = self._get("/api/qt/clist/get", {
                 "pn": page, "pz": page_size, "po": 1, "np": 1, "ut": UT,
-                "fltt": 2, "invt": 2, "fid": "f3", "fs": fs, "fields": FIELDS,
+                "fltt": 2, "invt": 2, "fid": "f3", "fs": fs,
+                "fields": fields or FIELDS,
             })
             data = payload.get("data") or {}
             diff = data.get("diff") or []
@@ -251,10 +237,8 @@ class DirectSource(DataSource):
 
     # -- 对外接口：行情（两个）--------------------------------------------
     def fetch_board(self, code: str, days: int | None = None) -> list[dict]:
-        """查板块**当天**快照。**1 个请求**：板块 secid 前缀固定是 90，直接精准取。
-
-        与个股不同（个股市场号要猜，最多 2 次），板块不用遍历全部板块、也不用翻页。
-        这个数据源只有「当天」，要历史请用 akshare 数据源。
+        """
+        拉板块**当天快照**（1 个请求，精准查询，不是扫列表）。
         """
         self._reject_history("板块", days)
         code = code.strip().upper()
@@ -290,16 +274,21 @@ class DirectSource(DataSource):
         raise LookupError(f"{code} 没查到数据（代码可能不存在）")
 
     # -- 板块成分股（板块字典用）------------------------------------------
+    def fetch_industry_boards(self, fields: str | None = None) -> list[dict]:
+        """
+        拉**全部行业板块**（一次扫全市场板块）：`fs = "m:90 t:2 f:!50"`，约 496 个 / 5 个请求。
+
+        ⚠️ 这 496 个是**扁平的混合表**：既有电子(BK1201) 这种一级，也有电池(BK1033) 这种二级，
+        接口本身**不给层级**。所以这里原样返回，层级关系见 board_tree.py。
+        """
+        return self._clist(FS_INDUSTRY, fields=fields)
+
     def fetch_board_members(self, code: str) -> list[dict]:
-        """拉某个板块的**成分股名单**，返回 [{"code":..., "name":...}, ...]。
+        """
+        拉某个板块的**成分股名单**：`fs = "b:BK1201 f:!50"`。
 
-        筛选条件是 `fs = "b:BK1201 f:!50"`（和取「全部行业板块」用的
-        `m:90 t:2 f:!50` 是同一个 clist 接口，只是换了筛选）。
-
-        ⚠️ 请求量 = 成员数 ÷ 100 向上取整（东财单页上限 100）：
-           BK1201 有 521 只 -> 6 个请求。所以**绝不能按板块逐个去拉**
-           （500 个板块 ≈ 3000 个请求）；日常行情走 fetch market，
-           这里只在「同步板块字典」时才用。
+        ⚠️ 请求量 = 成员数 ÷ 100 向上取整（单页上限 100）：BK1201 有 521 只 -> 6 个请求。
+        所以**绝不能按板块逐个去拉**（500 个板块 ≈ 3000 个请求）；日常行情走 fetch market。
         """
         code = code.strip().upper()
         rows = self._clist(f"b:{code} f:!50")
