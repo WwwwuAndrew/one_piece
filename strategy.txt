@@ -1,0 +1,1173 @@
+我建议我们现在先不要急着做 Stage 和综合评分。第一步应该是把 **Feature Layer** 做出来，让每个板块、每只股票每天都有一组稳定、可解释的原始指标。
+
+ 下面我按照你现在的模型，把它整理成一版可以直接进入开发的 **V1 指标规格**。其中我会特别标出哪些我认为可以直接定，哪些还需要我们后面通过实际数据校准。
+
+---
+
+ # 一、先确定整个指标体系
+
+ 你的模型实际上应该分成两层：
+
+```
+                    Raw Data
+                       │
+          ┌────────────┴────────────┐
+          ↓                         ↓
+       个股 Feature              板块 Feature
+          │                         │
+          │                         ├── Flow
+          │                         ├── Breadth
+          │                         ├── Efficiency
+          │                         └── Crowding
+          │
+          └──→ 板块聚合
+                       │
+                       ↓
+                    Stage
+                       │
+                       ↓
+                   Momentum
+```
+
+ 这里有一个很重要的原则：
+
+ > **先计算“事实”，再计算“判断”。**
+
+ 例如：
+
+ - `今日成交额 / MA20成交额 = 1.63` 是事实。
+- `Flow 很强` 是判断。
+- `Stage = ③成型` 是更高层判断。
+
+ 所以第一版数据库里，我建议**原始 Feature 全部保留，不要一上来就只存 Score。**
+
+---
+
+ # 二、板块层：四大核心维度
+
+ 目前板块层我建议保留：
+
+ 1. Flow
+2. Breadth
+3. Efficiency
+4. Crowding
+
+ 另外把 **Resilience** 暂时作为辅助 Feature，而不是第五个核心维度。
+
+---
+
+ # 三、Flow：资金参与度
+
+ 核心问题：
+
+ > **钱有没有来？来的钱是不是持续？**
+
+ | 指标 | 计算模型 | 输出 | 作用 |
+| --- | --- | --- | --- |
+| **Flow Ratio** | 板块今日成交额 ÷ 板块 MA20 成交额 | 倍数 | 核心 Flow |
+| **Flow Trend** | 板块 MA5 成交额 ÷ MA20 成交额 | 倍数 | 判断资金进入是否持续 |
+| **Flow Percentile** | 今日成交额在过去60日成交额中的百分位 | 0～100 | 判断当前量能是否异常 |
+| **Flow Rank** | 今日板块成交额在全部板块中的横截面百分位/排名 | 0～100 | 判断资金当前集中在哪里 |
+
+### 1\. Flow Ratio
+
+ $$
+FlowRatio_t=\frac{Amount_t}{MA20(Amount)_t}
+$$
+
+ 例如：
+
+```
+今日成交额 = 120亿
+过去20日平均 = 80亿
+
+Flow Ratio = 1.50
+```
+
+ 意味着：
+
+ > 今天的资金参与程度是正常水平的 1.5 倍。
+
+ 这是 Flow 最核心的指标。
+
+ ### 2\. Flow Trend
+
+ $$
+FlowTrend_t=\frac{MA5(Amount)_t}{MA20(Amount)_t}
+$$
+
+ 这个和 Flow Ratio 不一样。
+
+ 例如：
+
+```
+今天突然放量：
+
+Flow Ratio = 2.0
+Flow Trend = 1.1
+```
+
+ 说明：
+
+ > 今天爆了，但是之前并没有持续增加。
+
+ 而：
+
+```
+Flow Ratio = 1.4
+Flow Trend = 1.3
+```
+
+ 说明：
+
+ > 不是突然爆量，而是持续有资金进入。
+
+ 这正对应你原来的：
+
+ > **连续性比爆发更重要。**
+
+---
+
+ # 四、Breadth：扩散度
+
+ 核心问题：
+
+ > **到底是几个龙头在涨，还是整个板块都开始留下脚印？**
+
+ 这是我认为你的模型里非常重要的一层。
+
+ | 指标 | 计算模型 | 输出 | 作用 |
+| --- | --- | --- | --- |
+| **Up Ratio** | 上涨股票数 / 有效股票数 | 0～1 | 短期参与 |
+| **Above MA20 Ratio** | 收盘价 \> MA20 的股票数 / 有效股票数 | 0～1 | 中期扩散 |
+| **20D High Ratio** | 20日内创20日新高股票数 / 有效股票数 | 0～1 | 强势扩散 |
+| **Relative Strength Breadth** | 个股区间收益 \> 板块区间收益的股票数 / 有效股票数 | 0～1 | 判断是否全面跑赢 |
+
+---
+
+ ## 1\. Up Ratio
+
+ $$
+UpRatio=\frac{N(pct\_chg>0)}{N(valid)}
+$$
+
+ 例如：
+
+```
+板块 100 只股票
+
+上涨 72
+下跌 28
+
+Up Ratio = 72%
+```
+
+ 这是最短周期的 Breadth。
+
+---
+
+ ## 2\. Above MA20 Ratio
+
+ $$
+MA20Breadth=
+\frac{N(Close>MA20)}{N(valid)}
+$$
+
+ 例如：
+
+```
+100只股票
+68只在MA20以上
+
+= 68%
+```
+
+ 我认为这个比单纯上涨家数更加重要。
+
+ 因为：
+
+```
+今天上涨 80%
+```
+
+ 可能只是一天情绪。
+
+ 但是：
+
+```
+MA20上方 70%
+```
+
+ 说明这个板块内部已经形成了比较广泛的中期趋势。
+
+---
+
+ ## 3\. 20D High Ratio
+
+ 这里我建议 V1 定义得稍微严格一点：
+
+ $$
+High20Breadth=
+\frac{N(Close_t \geq \max(Close_{t-19:t}))}{N(valid)}
+$$
+
+ 也就是：
+
+ > 今天收盘是否处于过去20个交易日的最高位置。
+
+ 这里我要特别指出：
+
+ 你原文写的是：
+
+ > **20日内创过新高**
+
+ 这个定义和“今天创20日新高”其实不同。
+
+ 例如：
+
+```
+10天前创20日新高
+现在已经跌了8%
+```
+
+ 如果仍然算进去，会导致 Breadth 长时间保持虚高。
+
+ 所以**第一版我更倾向于用“当前20日新高”而不是“过去20日曾经创过新高”。**
+
+ 这个我们后面可以拿实际数据比较。
+
+---
+
+ ## 4\. Relative Strength Breadth
+
+ $$
+RSBreadth=
+\frac{
+N(R_i>R_{board})
+}{
+N(valid)
+}
+$$
+
+ 其中：
+
+ $$
+R_i=\prod_{k=1}^{N}(1+pct\_chg_k)-1
+$$
+
+ 例如：
+
+```
+板块5D收益 = +6%
+
+100只股票：
+
+65只 > +6%
+35只 ≤ +6%
+
+RS Breadth = 65%
+```
+
+ 这个指标非常有价值，因为它回答：
+
+ > **板块上涨到底是龙头拉出来的，还是大多数股票都在跑？**
+
+---
+
+ # 五、Efficiency：推进效率
+
+ 这是你整个模型里最有特色的维度。
+
+ 核心问题：
+
+ > **钱来了以后，究竟产生了多少价格推进？**
+
+ 我建议 V1 保持你原来的思想，但把公式稍微规范一下。
+
+ | 指标 | 计算模型 | 输出 | 作用 |
+| --- | --- | --- | --- |
+| **Efficiency 5D** | 5D收益 / 5D成交额放大倍数 | 连续值 | 短期推进能力 |
+| **Efficiency 20D** | 20D收益 / 20D成交额放大倍数 | 连续值 | 中期推进能力 |
+| **Efficiency Trend** | Efficiency 5D 相对于历史 Efficiency 的变化 | 连续值 | 判断效率变好/变坏 |
+
+---
+
+ ## 1\. Efficiency 5D
+
+ 先定义：
+
+ $$
+Return_{5D}
+=
+\prod_{k=1}^{5}(1+pct\_chg_k)-1
+$$
+
+ 成交额放大：
+
+ $$
+VolumeExpansion_{5D}
+=
+\frac{MA5(Amount)}{MA20(Amount)}
+$$
+
+ 然后：
+
+ $$
+Efficiency_{5D}
+=
+\frac{Return_{5D}}
+{VolumeExpansion_{5D}}
+$$
+
+ 例如：
+
+```
+5D收益       = +8%
+MA5/MA20     = 1.6
+
+Efficiency  = 0.05
+```
+
+ 它表达的是：
+
+ > 在当前资金投入程度下，产生了多少价格推进。
+
+---
+
+ ## 这里有一个重要问题
+
+ **Efficiency 原始值不能直接横向比较所有板块。**
+
+ 例如：
+
+```
+半导体天然波动大
+银行天然波动小
+```
+
+ 所以你原来提出的：
+
+ > 不同板块波动特性不同，直接比较不公平。
+
+ 这个判断是对的。
+
+ 因此第一版我们应该同时保存：
+
+```
+Efficiency Raw
+Efficiency Percentile
+```
+
+ 最终真正拿来比较的，更推荐：
+
+ $$
+EfficiencyPercentile
+=
+Percentile(Efficiency,\ 过去60日)
+$$
+
+ 也就是说：
+
+ > **一个板块现在的效率，相对于它自己历史处于什么位置。**
+
+ 而不是直接拿：
+
+```
+半导体 Efficiency = 0.08
+银行 Efficiency = 0.04
+```
+
+ 就说半导体效率更高。
+
+---
+
+ # 六、Efficiency Trend
+
+ 这个我建议暂时不要搞得太复杂。
+
+ V1 可以定义为：
+
+ $$
+EfficiencyTrend
+=
+Efficiency_{5D,t}
+-
+Efficiency_{5D,t-5}
+$$
+
+ 然后再标准化：
+
+ $$
+EfficiencyTrendZ
+=
+Z(Efficiency_{5D,t}-Efficiency_{5D,t-5})
+$$
+
+ 这样可以捕捉：
+
+```
+过去：
+钱越来越多
+价格还能继续推
+
+现在：
+钱更多
+但价格越来越推不动
+```
+
+ 这正是你想捕捉的：
+
+ > **量增价滞。**
+
+---
+
+ # 七、Crowding：拥挤度
+
+ 核心问题：
+
+ > **是不是已经有太多人进来了？**
+
+ 这里我建议和前面三个维度完全不同：
+
+ **Crowding 的所有原始指标都应该首先做 Percentile。**
+
+ | 指标 | 计算模型 | 输出 |
+| --- | --- | --- |
+| **5D Return Percentile** | 当前5D收益在过去60日中的百分位 | 0～100 |
+| **20D Return Percentile** | 当前20D收益在过去60日中的百分位 | 0～100 |
+| **Amount Percentile** | 当前成交额在过去60日中的百分位 | 0～100 |
+| **Volatility Percentile** | 当前波动率在过去60日中的百分位 | 0～100 |
+| **Extreme Ratio** | 涨停股票占板块比例 | 0～1 |
+
+---
+
+ ## 1\. 5D Return Percentile
+
+ $$
+P5=Percentile(Return_{5D,t},60D)
+$$
+
+ 例如：
+
+```
+过去60日5D收益分布
+
+当前5D收益 = +9%
+
+Percentile = 94
+```
+
+ 说明：
+
+ > 这个板块最近5天涨得已经非常极端。
+
+---
+
+ ## 2\. 20D Return Percentile
+
+ 同理：
+
+ $$
+P20=Percentile(Return_{20D,t},60D)
+$$
+
+ 用来避免：
+
+ > 短期突然爆发，但是中期其实并不高。
+
+---
+
+ ## 3\. Amount Percentile
+
+ $$
+PAmount=Percentile(Amount_t,60D)
+$$
+
+ 这里其实和 Flow Ratio 有区别：
+
+```
+Flow Ratio = 相对于MA20异常多少
+
+Amount Percentile = 历史上有多极端
+```
+
+ 两个都值得保留。
+
+---
+
+ ## 4\. Volatility Percentile
+
+ 建议 V1 用：
+
+ $$
+Volatility_{5D}
+=
+Std(pct\_chg_{t-4:t})
+$$
+
+ 然后：
+
+ $$
+PVol=Percentile(Volatility_{5D},60D)
+$$
+
+ 因为拥挤不仅表现为：
+
+ > 涨得多。
+
+ 也可能表现为：
+
+ > 波动开始极端化。
+
+---
+
+ ## 5\. Extreme Ratio
+
+ 例如：
+
+```
+板块100只股票
+涨停8只
+
+Extreme Ratio = 8%
+```
+
+ 这个指标我建议**保留，但不要让它在 Crowding 中占太大权重**。
+
+ 原因是涨停制度、ST、不同市场规则等会让它比较特殊。
+
+---
+
+ # 八、Crowding 最后怎么合成？
+
+ 第一版甚至可以**先不合成**。
+
+ 先保存：
+
+```
+Crowding_Return5
+Crowding_Return20
+Crowding_Amount
+Crowding_Vol
+Crowding_Extreme
+```
+
+ 然后你观察一个月真实数据。
+
+ 因为我现在不认为我们应该拍脑袋决定：
+
+```
+20D涨幅 30%
+成交额 30%
+波动率 20%
+...
+```
+
+ **先看分布，再决定权重。**
+
+ 如果一定需要 V1 一个 Crowding Score，我会先使用简单平均：
+
+ $$
+Crowding=
+\frac{
+P5+P20+PAmount+PVol+PExtreme
+}{5}
+$$
+
+ 这样至少没有人为制造权重。
+
+---
+
+ # 九、Resilience：回撤恢复能力
+
+ 这个我建议**先计算，但不要进入四大核心维度。**
+
+ 因为它非常有价值，但目前你的定义还不够严格。
+
+ 你现在的：
+
+ > 回撤后重新收复的幅度 ÷ 之前回撤的幅度
+
+ 思想是对的，但是程序必须明确：
+
+ > **哪一次回撤？**
+
+ 所以 V1 我建议先做一个非常明确的版本。
+
+ 例如寻找最近20日内的：
+
+```
+局部高点
+↓
+最大回撤
+↓
+当前价格
+```
+
+ 定义：
+
+ $$
+Recovery=
+\frac{Current-DrawdownLow}
+{Peak-DrawdownLow}
+$$
+
+ 例如：
+
+```
+高点 = 100
+低点 = 90
+当前 = 97
+
+Recovery = 70%
+```
+
+ 意味着：
+
+ > 已经收复此前回撤的70%。
+
+ 但这个指标我建议暂时作为：
+
+ > **辅助观察变量**
+
+ 而不是马上参与 Stage。
+
+ 因为它的路径依赖比较强，后面值得单独讨论。
+
+---
+
+ # 十、因此板块层第一版，我建议最终形成这张表
+
+ | Dimension | Feature | V1公式 | 是否核心 |
+| --- | --- | --- | --- |
+| **Flow** | Flow Ratio | Amount / MA20 Amount | ⭐⭐⭐ |
+|  | Flow Trend | MA5 Amount / MA20 Amount | ⭐⭐⭐ |
+|  | Flow Percentile | 60D Amount Percentile | ⭐⭐ |
+|  | Flow Rank | 横截面 Amount Percentile | ⭐ |
+| **Breadth** | Up Ratio | 上涨数 / 有效数 | ⭐⭐ |
+|  | Above MA20 | Close\>MA20 占比 | ⭐⭐⭐ |
+|  | 20D High Ratio | 当前20D新高占比 | ⭐⭐ |
+|  | RS Breadth | 跑赢板块股票占比 | ⭐⭐⭐ |
+| **Efficiency** | Efficiency 5D | Return5 / VolumeExpansion5 | ⭐⭐⭐ |
+|  | Efficiency 20D | Return20 / VolumeExpansion20 | ⭐⭐⭐ |
+|  | Efficiency Trend | Eff5D(t)-Eff5D(t-5) | ⭐⭐⭐ |
+| **Crowding** | Return 5D Percentile | 60D percentile | ⭐⭐ |
+|  | Return 20D Percentile | 60D percentile | ⭐⭐ |
+|  | Amount Percentile | 60D percentile | ⭐⭐ |
+|  | Volatility Percentile | 60D percentile | ⭐ |
+|  | Extreme Ratio | 涨停数 / 有效数 | ⭐ |
+| **辅助** | Resilience | 回撤恢复比例 | ⭐ |
+
+所以大概：
+
+ > **4个核心维度 + 15个左右 Feature + 1个辅助 Feature**
+
+ 和你最开始定的“板块控制在15个左右”基本一致。
+
+---
+
+ # 十一、然后是个股层
+
+ 这里我认为需要做一个非常重要的区分：
+
+ > **个股不要再复制板块的 Breadth。**
+
+ 个股的任务是：
+
+ > **在已经发现的板块里面，找到“最值得研究的股票”。**
+
+ 所以个股应该围绕：
+
+```
+Relative Strength
+Flow
+Efficiency
+Trend Confirmation
+Price Behavior
+Resilience
+Crowding
+```
+
+---
+
+ # 十二、个股 8 个核心指标
+
+ | # | 指标 | 计算模型 | 核心问题 |
+| --- | --- | --- | --- |
+| 1 | **5D RS** | 个股5D收益 − 板块5D收益 | 最近是否跑赢板块 |
+| 2 | **20D RS** | 个股20D收益 − 板块20D收益 | 中期是否跑赢板块 |
+| 3 | **Flow Ratio** | 个股成交额 / MA20成交额 | 有没有异常资金 |
+| 4 | **Flow Trend** | MA5成交额 / MA20成交额 | 资金是不是持续 |
+| 5 | **Efficiency** | 区间收益 / 成交额放大 | 钱推不推得动 |
+| 6 | **Breakout** | Close / 20D High | 是否价格确认 |
+| 7 | **CLV** | (Close-Low)/(High-Low) | 收盘是否强 |
+| 8 | **Recovery** | 回撤恢复比例 | 抛压后有没有承接 |
+
+---
+
+ # 十三、RS 是个股层最重要的东西
+
+ ### 5D RS
+
+ $$
+RS5=Return_{stock,5D}-Return_{board,5D}
+$$
+
+ 例如：
+
+```
+股票 +12%
+板块 +7%
+
+RS5 = +5%
+```
+
+ 这个比单纯：
+
+ > “股票涨了12%”
+
+ 有意义得多。
+
+ 因为你的策略不是找：
+
+ > **涨得最多的股票**
+
+ 而是：
+
+ > **在一个正在形成势能的板块里，找相对最强的股票。**
+
+---
+
+ # 十四、20D RS
+
+ $$
+RS20=Return_{stock,20D}-Return_{board,20D}
+$$
+
+ 它和5D RS 的作用不一样：
+
+```
+5D RS ↑
+20D RS ↓
+```
+
+ 可能意味着：
+
+ > **最近刚开始变强。**
+
+ 而：
+
+```
+5D RS ↑
+20D RS ↑
+```
+
+ 意味着：
+
+ > **持续强。**
+
+ 这两个指标以后很可能直接成为你的“早期启动”和“趋势确认”之间的重要区别。
+
+---
+
+ # 十五、个股 Flow
+
+ ### Flow Ratio
+
+ $$
+StockFlow=
+\frac{Amount_t}{MA20(Amount)}
+$$
+
+ 例如：
+
+```
+股票A：3.2
+股票B：1.4
+```
+
+ A 的成交额相对于自身历史异常程度明显更高。
+
+---
+
+ ### Flow Trend
+
+ $$
+StockFlowTrend=
+\frac{MA5(Amount)}{MA20(Amount)}
+$$
+
+ 和板块一样：
+
+ > 判断是突然爆量，还是连续有资金参与。
+
+---
+
+ # 十六、个股 Efficiency
+
+ 公式和板块基本一致：
+
+ $$
+Efficiency5=
+\frac{Return5}
+{MA5(Amount)/MA20(Amount)}
+$$
+
+ 但这里有一个区别：
+
+ > **个股 Efficiency 更应该拿来和“自己历史”比较，而不是和整个市场直接比较。**
+
+ 所以我建议保存：
+
+```
+Efficiency Raw
+Efficiency 60D Percentile
+```
+
+ 后续股票排序主要用 Percentile。
+
+---
+
+ # 十七、突破指标，我建议修改一下
+
+ 你原来：
+
+ > `收盘 > 20日最高`
+
+ 作为 V1 可以用，但存在一个问题：
+
+ 如果：
+
+```
+昨天最高 = 100
+今天最高 = 110
+今天收盘 = 101
+```
+
+ 它可能满足某些突破条件，但显然不是你想要的“漂亮突破”。
+
+ 所以我建议不要只保存一个：
+
+```
+Breakout = True/False
+```
+
+ 而是拆成两个 Feature。
+
+ ### Breakout Distance
+
+ $$
+BreakoutDistance=
+\frac{Close}{High20}-1
+$$
+
+ ### Breakout Quality
+
+ 结合：
+
+```
+Breakout Distance
++
+Flow Ratio
++
+CLV
+```
+
+ 例如：
+
+```
+突破
++ 成交额异常
++ CLV 0.95
+```
+
+ 才是：
+
+ > **高质量突破。**
+
+ 第一版甚至可以先只计算：
+
+```
+BreakoutDistance
+CLV
+FlowRatio
+```
+
+ 不要急着把它们合成一个 Breakout Score。
+
+---
+
+ # 十八、CLV
+
+ 这个指标我非常赞成保留。
+
+ $$
+CLV=
+\frac{Close-Low}{High-Low}
+$$
+
+ 范围：
+
+```
+0 → 收盘接近最低
+1 → 收盘接近最高
+```
+
+ 例如：
+
+```
+CLV = 0.93
+```
+
+ 说明：
+
+ > 全天价格推进以后，收盘仍然保持在高位。
+
+ 而：
+
+```
+CLV = 0.18
+```
+
+ 说明：
+
+ > 盘中虽然强，但最终大量回落。
+
+ 这正好对应你说的：
+
+ > **冲高回落。**
+
+ 唯一要注意的是：
+
+```
+High = Low
+```
+
+ 这种情况下需要特殊处理，避免除零。
+
+---
+
+ # 十九、Recovery
+
+ 个股也可以使用：
+
+ $$
+Recovery=
+\frac{Current-DrawdownLow}
+{Peak-DrawdownLow}
+$$
+
+ 但我建议和板块一样：
+
+ > **V1 先作为 Feature，不参与核心评分。**
+
+---
+
+ # 二十、个股 Crowding
+
+ 你原来的：
+
+ > 20日涨幅分位 + 60日涨幅分位 + 成交额分位 + 波动率分位
+
+ 我基本赞成。
+
+ 不过这里有一个小修改：
+
+ **不要只用“20日涨幅 + 60日涨幅”，最好全部转成 Percentile。**
+
+ | Feature | 公式 |
+| --- | --- |
+| Return20 Percentile | 20D收益的60D历史分位 |
+| Return60 Percentile | 60D收益的120D历史分位 |
+| Amount Percentile | 成交额的60D历史分位 |
+| Volatility Percentile | 波动率的60D历史分位 |
+
+最后：
+
+ $$
+StockCrowding=
+Mean(P20,P60,PAmount,PVol)
+$$
+
+ 仍然建议 V1 **等权**。
+
+---
+
+ # 二十一、最终个股表
+
+ | Dimension | Feature | 公式 | 优先级 |
+| --- | --- | --- | --- |
+| **Relative Strength** | RS5 | Stock Return5 − Board Return5 | ⭐⭐⭐ |
+|  | RS20 | Stock Return20 − Board Return20 | ⭐⭐⭐ |
+| **Flow** | Flow Ratio | Amount / MA20 Amount | ⭐⭐⭐ |
+|  | Flow Trend | MA5 Amount / MA20 Amount | ⭐⭐ |
+| **Efficiency** | Efficiency5 | Return5 / FlowExpansion5 | ⭐⭐⭐ |
+|  | Efficiency20 | Return20 / FlowExpansion20 | ⭐⭐ |
+| **Trend** | Breakout Distance | Close / High20 − 1 | ⭐⭐⭐ |
+|  | CLV | (Close-Low)/(High-Low) | ⭐⭐⭐ |
+| **Recovery** | Recovery | 回撤恢复比例 | ⭐ |
+| **Crowding** | Return20 Percentile | 60D percentile | ⭐⭐ |
+|  | Return60 Percentile | 120D percentile | ⭐⭐ |
+|  | Amount Percentile | 60D percentile | ⭐⭐ |
+|  | Volatility Percentile | 60D percentile | ⭐ |
+
+所以个股大概是：
+
+ > **8个核心 Feature + Crowding 4个辅助 Feature。**
+
+---
+
+ # 二十二、这里有一个我认为非常重要的架构决定
+
+ **不要现在就做“综合分数”。**
+
+ 比如不要马上搞：
+
+```
+Board Score =
+Flow × 25%
++ Breadth × 25%
++ Efficiency × 30%
+- Crowding × 20%
+```
+
+ 也不要马上：
+
+```
+Stock Score =
+RS × 30%
++ Flow × 20%
++ Efficiency × 20%
+...
+```
+
+ 因为现在我们还不知道：
+
+ > **这些指标实际跑出来是什么分布。**
+
+ 应该先做：
+
+```
+原始数据
+ ↓
+Feature
+ ↓
+看30~60个交易日
+ ↓
+看分布
+ ↓
+看相关性
+ ↓
+看极端案例
+ ↓
+再决定标准化
+ ↓
+最后才是 Score
+ ↓
+最后才是 Stage
+```
+
+---
+
+ # 二十三、我认为下一步真正应该做的是“指标体检”
+
+ 这会比继续讨论 UI 有价值很多。
+
+ 我们拿真实数据跑出类似：
+
+ | 日期 | 板块 | Flow | Breadth | Efficiency | Crowding |
+| --- | --- | --- | --- | --- | --- |
+| 9/1 | AI | 0.92 | 38% | -0.02 | 31 |
+| 9/2 | AI | 1.08 | 45% | 0.01 | 38 |
+| 9/3 | AI | 1.21 | 53% | 0.04 | 46 |
+| 9/4 | AI | 1.38 | 62% | 0.07 | 59 |
+| 9/5 | AI | 1.55 | 71% | 0.05 | 77 |
+
+然后我们才能真正看到：
+
+```
+Flow       ↑
+Breadth    ↑
+Efficiency ↑ → ↓
+Crowding   ↑
+```
+
+ 这时候你会非常直观地看到：
+
+ > **这个数据到底像不像我们脑子里的“势能”。**
+
+---
+
+ # 二十四、所以我建议现在先把模型锁成这一版
+
+ ### 板块
+
+```
+FLOW
+├── Flow Ratio
+├── Flow Trend
+├── Flow Percentile
+└── Flow Rank
+
+BREADTH
+├── Up Ratio
+├── Above MA20 Ratio
+├── 20D High Ratio
+└── RS Breadth
+
+EFFICIENCY
+├── Efficiency 5D
+├── Efficiency 20D
+└── Efficiency Trend
+
+CROWDING
+├── Return 5D Percentile
+├── Return 20D Percentile
+├── Amount Percentile
+├── Volatility Percentile
+└── Extreme Ratio
+
+辅助
+└── Resilience
+```
+
+ ### 个股
+
+```
+RELATIVE STRENGTH
+├── RS 5D
+└── RS 20D
+
+FLOW
+├── Flow Ratio
+└── Flow Trend
+
+EFFICIENCY
+├── Efficiency 5D
+└── Efficiency 20D
+
+TREND / PRICE BEHAVIOR
+├── Breakout Distance
+└── CLV
+
+RECOVERY
+└── Resilience
+
+CROWDING
+├── Return 20D Percentile
+├── Return 60D Percentile
+├── Amount Percentile
+└── Volatility Percentile
+```
+
+ **而 Stage、Momentum、Score、Risk 暂时全部不要动。**
+
+ 我认为这才是现在最稳的开发顺序。
+
+ 尤其有三个地方，我建议我们下一轮重点拿真实数据讨论，而不是继续凭理论拍板：
+
+ 1. **Efficiency 的具体定义**——目前“收益 / 成交额放大倍数”方向正确，但还需要验证它的分布和稳定性。
+2. **20D High Ratio 到底用“今天创高”还是“20日内曾创高”**——我倾向前者。
+3. **Crowding 的构成和时间窗口**——这是最容易把模型搞成“涨多了 = 拥挤”的地方，需要用真实历史数据验证。
+
+ 如果这三个地方定下来，**Feature Layer 基本就可以开始编码了**；然后我们拿真实的 20～60 个交易日数据把每个 Feature 跑出来，看它们到底呈现什么样的数值分布，再进入 Stage 模型。

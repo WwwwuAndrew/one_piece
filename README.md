@@ -124,8 +124,11 @@ python3 hunter.py update member watch     # 只同步自选里板块的成分股
 ```bash
 python3 hunter.py update tree      # 建/更新「一级 + 二级」板块表（东财 5 + 乐咕 3 个请求）
 python3 hunter.py fetch board      # 把一级 31 + 二级 128 个板块的行情一起刷一遍
+python3 hunter.py fetch board --level 2   # 只刷二级那 128 个（--level 1 只刷一级 31 个）
 python3 hunter.py show board       # 一级一个标签，面板里一级在上、二级依次在下
 ```
+
+想看方向就先刷一级（31 个请求），确定哪条线动了再 `--level 2` 或者直接 `fetch <二级代码>`。
 
 **只到二级**（不要三级：三级有 337 个、粒度太细）。`update tree` 会顺手把字典里那些
 三级条目清掉 —— 只删字典那一行，**你抓过的行情和成分股一行都不动**。
@@ -251,7 +254,16 @@ fetch_interval: 2.0        # 两次联网请求之间的间隔秒数
 ## 目录结构
 
 ```
-├── hunter.py                  ★ 唯一执行入口（命令行）
+├── hunter.py                  ★ 唯一执行入口（只做一件事：把命令行交给 cli/）
+├── cli/                       命令行层
+│   ├── app.py                 命令行长什么样 + 分派成命令对象
+│   ├── base.py                依赖装配（Context）+ 标的/新鲜度判据 + 命令基类
+│   ├── console.py             所有给人看的输出（改文案只动这一个文件）
+│   ├── fetch.py               fetch market / backfill market / fetch board / fetch watch
+│   ├── watch.py               自选（加入 / 移出 / 列出）
+│   ├── members.py             update member（成分股名单 + 防反爬）
+│   ├── catalog.py             update stock / update tree / drop board
+│   └── show.py                show
 ├── config/
 │   ├── config.py              读 yaml 的 Config 单例
 │   └── system.yaml            数据源 / token / 间隔
@@ -267,9 +279,14 @@ fetch_interval: 2.0        # 两次联网请求之间的间隔秒数
 │   ├── stock.py               个股封装接口（Stocks）
 │   └── show_data.py           展示层（图形化页面 / 控制台表格）
 ├── doc/model.md               ★ 模型本身（四因子 / 五阶段 / 判断闭环）
-├── data/                      数据（见上）
-└── test.py                    排障小工具（探板块成分股）
+└── data/                      数据（见上）
 ```
+
+分层：`hunter.py` → `cli/`（命令与输出）→ `datasource/`（数据源与存储）→ `config/`。
+
+`cli/base.py` 里的 `Context` 是**唯一的依赖装配点**：库、自选、数据源、输出都在那里造。
+命令里不出现 `Fetcher()` / `DirectSource()` / `store` 这类全局，所以换库、换数据源、
+写测试都只动一处。
 
 ## 架构
 
