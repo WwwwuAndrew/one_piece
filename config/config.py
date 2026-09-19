@@ -7,9 +7,9 @@ config.py —— 配置单例。
 
     from config.config import config        # 单例，全局只有一个实例
 
-    config.system.get("fetch_type")         # -> "direct"
+    config.system.get("fetch_interval")     # -> 2.0
     config.system.get("没有这个键", "默认值")  # -> "默认值"
-    config.system.all()                     # -> {"fetch_type": "direct"} 整个文件
+    config.system.all()                     # -> {"fetch_interval": 2.0} 整个文件
     config.get("system", "fetch_type")      # 另一种等价写法
     config.sections()                       # -> ["system"] 当前加载了哪些配置
 

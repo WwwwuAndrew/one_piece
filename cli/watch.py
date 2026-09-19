@@ -7,7 +7,7 @@ watch.py —— 自选（watchlist）。
 板块和个股共用一张表，kind 是 'board' / 'stock'。
 
 ⚠️ watch / unwatch 只改本地状态，**一个请求都不发**。要拉数据是下一步的事
-   （fetch watch / update member watch / show watch），网络动作永远由你显式触发。
+   （show watch），网络动作永远由你显式触发。
 """
 
 from __future__ import annotations

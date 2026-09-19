@@ -6,7 +6,7 @@ store.py —— SQLite 存取层。按「**能不能重建**」分两个库（�
     data/raw/raw.sqlite      原始数据，全都能重新下载，删了不可惜
         stock_daily      全市场个股日线（一天约 5550 行）  amount=元 volume=股
         stock_list       个股字典（代码 → 名字）
-        board_daily      板块日线（一级 + 二级）
+        board_daily      板块聚合日线（本地计算，一级 + 二级）
         board_list       板块字典（代码 → 名称 + 成员同步时间）
         board_tree       板块层级（一级/二级 + 上级），来自申万分类
         concept_member   板块 → 成员（**快照**，没有日期列）
@@ -81,33 +81,17 @@ CREATE TABLE IF NOT EXISTS stock_list (
     updated_at INTEGER            -- 上次同步时间 YYYYMMDD
 ) WITHOUT ROWID;
 
--- 东财板块日线
+-- 板块聚合日线（本地从个股聚合而来，见 datasource/board_calc.py）
 CREATE TABLE IF NOT EXISTS board_daily (
-    concept       TEXT    NOT NULL,     -- BK1201
+    concept       TEXT    NOT NULL,     -- 801080.SI（申万代码）
     trade_date    INTEGER NOT NULL,     -- YYYYMMDD
-    source        TEXT,                 -- direct / akshare
-    price         REAL,                 -- 板块点位
-    change_pct    REAL,
-    change        REAL,
-    amount        REAL,                 -- 元
-    volume        REAL,                 -- 股
-    up            INTEGER,              -- 上涨家数
-    down          INTEGER,              -- 下跌家数
-    flat          INTEGER,              -- 平盘家数
-    open          REAL,
-    high          REAL,
-    low           REAL,
-    pre_close     REAL,
-    amplitude_pct REAL,
-    turnover_pct  REAL,
-    total_mv      REAL,
-    float_mv      REAL,
-    pe            REAL,
-    volume_ratio  REAL,
-    pb            REAL,
-    chg_60d       REAL,
-    chg_ytd       REAL,
-    quote_time    TEXT,
+    source        TEXT,                 -- 'local'（本地聚合）
+    change_pct    REAL,                 -- 板块涨跌幅 %（成分股市值加权）
+    amount        REAL,                 -- Σ成分股成交额（元）
+    volume        REAL,                 -- Σ成分股成交量（股）
+    up            INTEGER,              -- 上涨家数（pct_chg > 0）
+    down          INTEGER,              -- 下跌家数（pct_chg < 0）
+    flat          INTEGER,              -- 平盘家数（pct_chg = 0）
     PRIMARY KEY (concept, trade_date)
 ) WITHOUT ROWID;
 
@@ -121,24 +105,25 @@ CREATE TABLE IF NOT EXISTS board_list (
     member_updated_at INTEGER            -- 成员上次同步时间 YYYYMMDD
 ) WITHOUT ROWID;
 
--- 板块层级：东财的行业板块其实用的是**申万分类**（一级/二级/三级混在一张扁平表里），
--- 层级从申万公开的分类表拿（见 datasource/board_tree.py），这里只存结果。
+-- 板块层级：直接用申万分类（乐咕乐股提供，见 datasource/fetch_legu.py），
+-- concept 本身就是申万代码，所以不再需要单独的 sw_code 列。
 CREATE TABLE IF NOT EXISTS board_tree (
-    concept     TEXT PRIMARY KEY,     -- BK1201
-    name        TEXT,                 -- 东财用的名字（可能带 Ⅱ/Ⅲ 后缀）
-    level       INTEGER,              -- 1 / 2 / 3
-    parent      TEXT,                 -- 上级板块代码；一级为 NULL
-    sw_code     TEXT,                 -- 申万行业代码（801080.SI），对不上就是 NULL
+    concept     TEXT PRIMARY KEY,     -- 801080.SI（申万代码）
+    name        TEXT,                 -- 申万行业名称（可能带 Ⅱ/Ⅲ 后缀）
+    level       INTEGER,              -- 1 / 2
+    parent      TEXT,                 -- 上级板块代码（.SI）；一级为 NULL
     updated_at  INTEGER
 ) WITHOUT ROWID;
 
 -- 按层级筛（「只看二级板块」）/ 按上级找子板块
 CREATE INDEX IF NOT EXISTS idx_board_tree_parent ON board_tree(parent);
 
--- 板块成员：快照式（只有「现在有哪些」，没有 start/end 日期）
+-- 板块成员：快照式（只有「现在有哪些」，没有 start/end 日期）。
+-- mktcap 是总市值（元），用于板块涨跌幅的市值加权；拿不到就是 NULL。
 CREATE TABLE IF NOT EXISTS concept_member (
-    concept TEXT NOT NULL,
-    code    TEXT NOT NULL,
+    concept TEXT NOT NULL,             -- 801080.SI
+    code    TEXT NOT NULL,             -- 300308（无交易所后缀）
+    mktcap  REAL,                      -- 总市值（元）
     PRIMARY KEY (concept, code)
 ) WITHOUT ROWID;
 
@@ -152,7 +137,7 @@ LOCAL_SCHEMA = """
 --   板块和个股都有行 = 在自选；没行 = 没关注过
 CREATE TABLE IF NOT EXISTS watchlist (
     kind       TEXT    NOT NULL,        -- 'board' | 'stock'
-    code       TEXT    NOT NULL,        -- BK1201 / 300308
+    code       TEXT    NOT NULL,        -- 801080.SI / 300308
     name       TEXT,
     watched_at INTEGER,                 -- YYYYMMDD；NULL = 已移除
     note       TEXT,
@@ -165,14 +150,11 @@ RAW_TABLE_COLS: dict[str, tuple] = {
     "stock_daily": ("code", "trade_date", "open", "high", "low", "close",
                     "pre_close", "change", "pct_chg", "volume", "amount"),
     "stock_list": ("code", "name", "updated_at"),
-    "board_daily": ("concept", "trade_date", "source", "price", "change_pct",
-                    "change", "amount", "volume", "up", "down", "flat",
-                    "open", "high", "low", "pre_close", "amplitude_pct",
-                    "turnover_pct", "total_mv", "float_mv", "pe",
-                    "volume_ratio", "pb", "chg_60d", "chg_ytd", "quote_time"),
+    "board_daily": ("concept", "trade_date", "source", "change_pct",
+                    "amount", "volume", "up", "down", "flat"),
     "board_list": ("concept", "name", "member_updated_at"),
-    "board_tree": ("concept", "name", "level", "parent", "sw_code", "updated_at"),
-    "concept_member": ("concept", "code"),
+    "board_tree": ("concept", "name", "level", "parent", "updated_at"),
+    "concept_member": ("concept", "code", "mktcap"),
 }
 
 LOCAL_TABLE_COLS: dict[str, tuple] = {
@@ -347,10 +329,20 @@ class Store(SqliteDB):
         prepared = [{**r, "trade_date": date_to_int(r.get("trade_date"))} for r in rows]
         return self._insert("stock_daily", self.TABLE_COLS["stock_daily"], prepared)
 
-    # -- 写：东财板块日线 -------------------------------------------------
+    # -- 写：板块聚合日线 -------------------------------------------------
     def save_board_daily(self, rows: list[dict]) -> int:
         prepared = [{**r, "trade_date": date_to_int(r.get("trade_date"))} for r in rows]
         return self._insert("board_daily", self.TABLE_COLS["board_daily"], prepared)
+
+    def delete_board_daily(self, concepts: list[str] | None = None) -> int:
+        """删板块聚合日线（fetch board --force 全量重算前用）。concepts 为空 = 全部。"""
+        with self.conn:
+            if concepts:
+                cur = self.conn.executemany(
+                    "DELETE FROM board_daily WHERE concept = ?", [(c,) for c in concepts])
+            else:
+                cur = self.conn.execute("DELETE FROM board_daily")
+        return cur.rowcount
 
     # -- 写：板块字典 -----------------------------------------------------
     def upsert_stock_list(self, rows: list[dict]) -> int:
@@ -385,23 +377,25 @@ class Store(SqliteDB):
         return cur.rowcount
 
     # -- 写：板块成员（整块替换）-----------------------------------------
-    def replace_board_members(self, concept: str, codes: list[str],
+    def replace_board_members(self, concept: str, members: list[dict],
                               updated_at=None) -> int:
         """同步一个板块的成员：先全删、再全插，语义 = 「删掉的去除、新增的加上」。
 
-        比自己算差集简单，也不会算错。一个板块几百个成员是微秒级操作。
+        members : [{"code": "300308", "mktcap": 123456789.0}, …]
+                  mktcap 是总市值（元），给市值加权当权重用；没有就是 None。
         """
         with self.conn:
             self.conn.execute("DELETE FROM concept_member WHERE concept = ?", (concept,))
             self.conn.executemany(
-                "INSERT OR IGNORE INTO concept_member (concept, code) VALUES (?, ?)",
-                [(concept, c) for c in codes])
+                "INSERT OR IGNORE INTO concept_member (concept, code, mktcap) "
+                "VALUES (?, ?, ?)",
+                [(concept, str(m.get("code")), m.get("mktcap")) for m in members])
             self.conn.execute(
                 "INSERT INTO board_list (concept, member_updated_at) VALUES (?, ?) "
                 "ON CONFLICT(concept) DO UPDATE SET "
                 "member_updated_at=excluded.member_updated_at",
                 (concept, date_to_int(updated_at) if updated_at else None))
-        return len(codes)
+        return len(members)
 
     # -- 读：个股日线 -----------------------------------------------------
     def stock_day_counts(self) -> dict[int, int]:
@@ -471,7 +465,7 @@ class Store(SqliteDB):
 
         只删行情会留下「字典有、成员有、但没行情」的半截状态，
         下次 fetch board 还会把它当成「在跟的板块」又刷一遍。
-        ⚠️ 删掉的是历史，要拿回来得重新 fetch + update member。
+        ⚠️ 删掉的是历史，要拿回来得 update board + fetch board。
         """
         concept = str(concept).strip().upper()
         out = {}
@@ -563,6 +557,17 @@ class Store(SqliteDB):
         rows = self.query("SELECT code FROM concept_member WHERE concept = ? ORDER BY code",
                           (concept,))
         return [r["code"] for r in rows]
+
+    def load_board_members_weighted(self, concept: str) -> list[dict]:
+        """一个板块的成员 + 总市值：board_calc 做市值加权用。"""
+        return [dict(r) for r in self.query(
+            "SELECT code, mktcap FROM concept_member WHERE concept = ? ORDER BY code",
+            (concept,))]
+
+    def load_all_members(self) -> list[dict]:
+        """全部成员关系（含 mktcap），board_calc 一次拿全量。"""
+        return [dict(r) for r in self.query(
+            "SELECT concept, code, mktcap FROM concept_member ORDER BY concept, code")]
 
     def boards_of(self, code: str) -> list[str]:
         """反查：这只股票属于哪些板块。"""
@@ -669,7 +674,7 @@ def _selftest() -> int:
         assert raw.stock_day_counts() == {20260909: 3, 20260910: 3, 20260911: 3}
         print("stock_day_counts / delete_stock_days ✅（重拉靠先删后写）")
 
-        raw.upsert_board_list([{"concept": "BK1201", "name": "电子"}])
+        raw.upsert_board_list([{"concept": "801080.SI", "name": "电子"}])
         raw.upsert_stock_list([{"code": "300308", "name": "中际旭创",
                                 "updated_at": "2026-09-11"}])
         assert raw.stock_name("300308") == "中际旭创"
@@ -677,40 +682,50 @@ def _selftest() -> int:
         raw.upsert_stock_list([{"code": "300308", "name": None}])   # 空名字不覆盖
         assert raw.stock_name("300308") == "中际旭创"
         print("stock_list: 个股字典 upsert / 按代码取名字 ✅（空名字不覆盖）")
-        raw.replace_board_members("BK1201", ["300308", "000001"], updated_at="2026-09-11")
-        assert raw.load_board_members("BK1201") == ["000001", "300308"]
-        raw.replace_board_members("BK1201", ["300308", "600519"], updated_at="2026-09-12")
-        assert raw.load_board_members("BK1201") == ["300308", "600519"]   # 旧的清掉了
-        assert raw.boards_of("600519") == ["BK1201"]
+        raw.replace_board_members("801080.SI",
+                                  [{"code": "300308", "mktcap": 1e10},
+                                   {"code": "000001", "mktcap": 2e10}],
+                                  updated_at="2026-09-11")
+        assert raw.load_board_members("801080.SI") == ["000001", "300308"]
+        raw.replace_board_members("801080.SI",
+                                  [{"code": "300308", "mktcap": 1e10},
+                                   {"code": "600519", "mktcap": 3e10}],
+                                  updated_at="2026-09-12")
+        assert raw.load_board_members("801080.SI") == ["300308", "600519"]   # 旧的清掉了
+        assert raw.boards_of("600519") == ["801080.SI"]
+        # 市值权重也一并存进去了
+        weighted = raw.load_board_members_weighted("801080.SI")
+        assert {m["code"]: m["mktcap"] for m in weighted} == {"300308": 1e10, "600519": 3e10}
         # 同步成员不该动字典里的名字
         assert raw.load_board_list()[0]["name"] == "电子"
-        print("board_list + concept_member: 整块替换、名字不被覆盖 ✅")
+        print("board_list + concept_member: 整块替换、市值权重、名字不被覆盖 ✅")
 
-        bd = raw.save_board_daily([{"concept": "BK1201", "trade_date": "2026-09-11",
-                                    "price": 12730.57, "amount": 488620000000.0,
-                                    "up": 97, "down": 420, "flat": 4, "source": "direct"}])
-        assert bd == 1 and raw.load_board_daily("BK1201", days=5)[0]["amount"] == 488620000000.0
+        bd = raw.save_board_daily([{"concept": "801080.SI", "trade_date": "2026-09-11",
+                                    "change_pct": 1.25, "amount": 488620000000.0,
+                                    "volume": 1e9, "up": 97, "down": 420, "flat": 4,
+                                    "source": "local"}])
+        assert bd == 1 and raw.load_board_daily("801080.SI", days=5)[0]["amount"] == 488620000000.0
         print("board_daily: 写入/读取 ✅（amount 存原始「元」）")
 
         # ---- 自选（独立的库）----
-        loc.watch("board", "bk1201", name="电子", at="2026-09-11")
+        loc.watch("board", "801080.SI", name="电子", at="2026-09-11")
         loc.watch("stock", "300308", name="中际旭创", at="2026-09-11")
         loc.watch("stock", "600519", name="贵州茅台", note="长线", at="2026-09-12")
         wl = loc.load_watchlist()
         print("\n自选: " + ", ".join(f"{x['kind']}:{x['code']}({x['name']})" for x in wl))
-        assert len(wl) == 3 and loc.is_watched("board", "BK1201")
+        assert len(wl) == 3 and loc.is_watched("board", "801080.SI")
 
         loc.watch("stock", "300308", at="2026-09-13")      # 重复加入只刷新
         assert len(loc.load_watchlist("stock")) == 2
 
-        loc.unwatch("board", "BK1201")
-        assert not loc.is_watched("board", "BK1201")
+        loc.unwatch("board", "801080.SI")
+        assert not loc.is_watched("board", "801080.SI")
         assert len(loc.load_watchlist()) == 2
         assert loc.query("SELECT COUNT(*) AS n FROM watchlist")[0]["n"] == 3   # 行还在
         print("移除自选: 行保留、只是不在列表里 ✅")
 
         try:
-            loc.watch("sector", "BK1201"); raise SystemExit("应报错")
+            loc.watch("sector", "801080.SI"); raise SystemExit("应报错")
         except ValueError as e:
             print(f"kind 写错 -> {e}")
 

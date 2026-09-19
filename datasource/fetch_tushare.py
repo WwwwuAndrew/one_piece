@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fetch_tushare.py —— tushare 数据源（全市场日线 + 个股 + 个股字典）。
+fetch_tushare.py —— tushare 数据源（全市场日线 + 个股字典 + 交易日历）。
 
     src = TushareSource()                    # token 从 config/system.yaml 读
     day, rows = src.fetch_market_daily()     # ★ 全市场最近有数据的一天（1 个请求）
     rows = src.fetch_market_on("2026-09-15") # 严格只这一天，没有就 []
-    src.fetch_stock("300308", days=15)       # 单只个股
-    src.fetch_stock_list()                   # 全市场名字（1 个请求）
+    rows = src.fetch_stock_list()            # 全市场名字（1 个请求）
     days = src.trade_days("2026-08-01", "2026-09-15")   # 交易日历
 
-只支持个股和全市场；`fetch_board` 会明确报错（板块走 direct / akshare）。
+只做「全市场个股行情 + 个股字典」；板块定义走 fetch_legu.py，
+板块指标由本地从个股聚合（board_calc.py）。
 
 ★ 关键：tushare 官方建议**循环日期取全市场，不要循环 ts_code**。
-  单次上限 6000 条而全市场约 5500 只，所以**一天 1 个请求** ——
-  这正是「东财只做板块字典、行情只拉一次」那套架构成立的前提。
+  单次上限 6000 条而全市场约 5500 只，所以**一天 1 个请求**。
 
-⚠️ 单位换算（tushare 和东财不一样，必须换）：
+⚠️ 单位换算（tushare 用的是「手 / 千元」，入库前必须换成「股 / 元」）：
       vol    手   -> 股   × 100
       amount 千元 -> 元   × 1000
-⚠️ `daily` 不返回名字、也不返回换手率/振幅/量比/市值（那些在 daily_basic，是另一次请求）。
+⚠️ `daily` 不返回名字（也不返回换手率/振幅/量比/市值，那些在 daily_basic）。
    名字用 fetch_stock_list() 一次拉全量，别按只查。
 """
 
@@ -29,14 +28,11 @@ from datetime import datetime, timedelta
 
 from config.config import config
 
-from .base import BEIJING, DataSource, date_window, to_date, to_num, to_ts_code
+from .base import BEIJING, DataSource, to_date, to_num
 
-# tushare daily 必须有的字段，缺了就说明接口变了，必须立刻报错而不是硬凑
-_REQUIRED = ("trade_date", "open", "high", "low", "close",
-             "pre_close", "change", "pct_chg", "vol", "amount")
-
-# 取全市场时额外要求 ts_code（要靠它才知道每行是哪只股票）
-_MARKET_REQUIRED = ("ts_code",) + _REQUIRED
+# 取全市场时要求这些字段（缺了就说明接口变了，必须立刻报错而不是硬凑）
+_MARKET_REQUIRED = ("ts_code", "trade_date", "open", "high", "low", "close",
+                    "pre_close", "change", "pct_chg", "vol", "amount")
 
 # tushare 单次最多返回 6000 行。全市场约 5400 只，离上限不远 ——
 # 一旦哪天真的顶到上限，说明**很可能被截断了**，必须吼一声（宁可吵也不要静静少一半）。
@@ -67,11 +63,6 @@ class TushareSource(DataSource):
 
         import tushare as ts          # 放在这里 import：只用板块时不必加载 tushare
         self.pro = ts.pro_api(token, timeout=timeout)
-
-    # -- 板块：不支持 -----------------------------------------------------
-    def fetch_board(self, code: str, days: int | None = None) -> list[dict]:
-        raise NotImplementedError(
-            "TushareSource 只提供个股数据；板块请用 direct（当天）或 akshare（历史）")
 
     # -- 交易日历 ---------------------------------------------------------
     def trade_days(self, start, end) -> list[str]:
@@ -198,61 +189,3 @@ class TushareSource(DataSource):
             if code:
                 out.append({"code": code, "name": str(name) if name else None})
         return out
-
-    # -- 个股 -------------------------------------------------------------
-    def fetch_stock(self, code: str, days: int | None = None) -> list[dict]:
-        code = str(code).strip().zfill(6)
-        ts_code = to_ts_code(code)
-        n = max(days or 1, 1)
-        start, end = date_window(n)
-
-        try:
-            df = self.pro.daily(ts_code=ts_code, start_date=start, end_date=end)
-        except Exception as exc:
-            raise RuntimeError(
-                f"tushare daily 调用失败：{type(exc).__name__}: {exc}\n"
-                f"    接口: pro.daily(ts_code={ts_code!r}, "
-                f"start_date={start!r}, end_date={end!r})") from exc
-
-        if df is None or len(df) == 0:
-            raise LookupError(
-                f"tushare 在 {start} ~ {end} 没有 {ts_code} 的数据"
-                f"（代码可能不对，或区间内无交易日）")
-
-        missing = [f for f in _REQUIRED if f not in df.columns]
-        if missing:
-            raise RuntimeError(
-                f"tushare daily 返回的字段和预期不一致，缺少 {missing}；"
-                f"实际字段：{list(df.columns)}")
-
-        # tushare 默认按交易日倒序返回，统一成升序后取最近 n 条
-        df = df.sort_values("trade_date")
-        rows = df.tail(n)
-
-        records = []
-        for _, row in rows.iterrows():
-            rec: dict = {
-                "code": code,
-                "date": to_date(row.get("trade_date")),
-                "price": to_num(row.get("close")),
-                "change_pct": to_num(row.get("pct_chg")),
-                "change": to_num(row.get("change")),
-                "open": to_num(row.get("open")),
-                "high": to_num(row.get("high")),
-                "low": to_num(row.get("low")),
-                "pre_close": to_num(row.get("pre_close")),
-            }
-
-            # 单位换算：手 -> 股；千元 -> 元
-            vol = to_num(row.get("vol"))
-            if vol is not None:
-                rec["volume"] = vol * 100
-            amount = to_num(row.get("amount"))
-            if amount is not None:
-                rec["amount"] = amount * 1000
-
-            records.append({k: v for k, v in rec.items() if v is not None})
-
-        if not records:
-            raise LookupError(f"tushare 没有返回 {ts_code} 的任何记录")
-        return records

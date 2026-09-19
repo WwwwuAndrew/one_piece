@@ -3,24 +3,19 @@
 """
 base.py —— 数据源基类 + 全项目共用的工具函数。
 
-所有数据源继承 DataSource，只覆盖自己支持的方法，不支持的直接抛 NotImplementedError。
-（故意不用 abc：三个来源支持的范围本来就不一样，给个「不支持就报错」的默认实现更诚实。）
+数据源（现在两个，能力互不重叠）：
+    TushareSource  全市场个股日线 / 个股字典 / 交易日历（fetch_tushare.py）
+    LeguSource     申万板块层级 / 成分股（fetch_legu.py）
+基类 DataSource 只约定「来源名字」，具体方法由子类自己定义。
 
-方法契约
-    · 统一返回 list[dict]；days=None 只要最新一条，days=N 要最近 N 个交易日。
-    · 金额一律给**元**、成交量给**股**（tushare 的「千元 / 手」要在数据源里先换算）。
-    · 字段名一律用这套对外名：
-          date · code · name · price · change_pct · change
-          open · high · low · pre_close · volume · amount
-      两张表的列名**并不一样**（板块 price/change_pct，个股 close/pct_chg），
-      翻成各表的列名是 Fetcher._to_row 一个地方的事 —— 漏翻不会报错，
-      只会让那一列静默变 NULL，所以那条路必须有测试盯着。
-    · 字段可以少给（拿不到的就不给），入库时缺的自动是 NULL。
-    · 拿不到的能力要明确报错，绝不静默少返回数据。
+单位约定
+    库里一律存**原始单位**：金额 = 元，成交量 = 股。
+    换算成「亿 / 万」只发生在展示那一步。
 
 数据层
-    data/raw/raw.sqlite 里的表是唯一真相（早期用过 jsonl，已退役）。
-    库里存**原始单位**（元 / 股），换算成「亿 / 万」只发生在展示那一步。
+    data/raw/raw.sqlite 里的表是唯一真相。
+    板块指标（board_daily）由本地从个股日线聚合（board_calc.py），
+    不来自任何第三方行情源。
 """
 
 from __future__ import annotations
@@ -36,18 +31,15 @@ BEIJING = timezone(timedelta(hours=8))
 # ---------------------------------------------------------------------------
 
 class DataSource:
-    """数据源基类。子类覆盖自己支持的方法，不支持的直接抛 NotImplementedError。"""
+    """数据源基类：只约定「来源名字」。具体方法由子类自行定义。
+
+    现在只有两类源，能力互不重叠，所以基类不再强行规定统一接口。
+    """
 
     # ⚠️ 这是**数据源自己的名字**（写进记录的 source 字段），不是「标的的名字」。
     #    子类必须显式声明；实例里也不要再写 self.name = ...（会把数据源名字顶掉）。
     #    （忘了声明就会继承成 "base"，那是最难查的一类错：数据看着都对，来源是假的。）
     name = "base"
-
-    def fetch_board(self, code: str, days: int | None = None) -> list[dict]:
-        raise NotImplementedError(f"{type(self).__name__} 不支持板块数据")
-
-    def fetch_stock(self, code: str, days: int | None = None) -> list[dict]:
-        raise NotImplementedError(f"{type(self).__name__} 不支持个股数据")
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} name={self.name!r}>"
@@ -58,7 +50,19 @@ class DataSource:
 # ---------------------------------------------------------------------------
 
 def is_board_code(code: str) -> bool:
-    return bool(re.fullmatch(r"BK\d{4}", str(code).strip().upper()))
+    """板块代码：申万行业代码 + .SI 后缀，形如 801080.SI。"""
+    return bool(re.fullmatch(r"\d{6}\.SI", str(code).strip().upper()))
+
+
+def normalize_board_code(code: str) -> str:
+    """把各种写法统一成「801080.SI」：大写，缺 .SI 后缀就补上。
+
+    只对「6 位数字」和「6 位数字.SI」这两种合法写法生效，其它原样返回。
+    """
+    c = str(code).strip().upper()
+    if re.fullmatch(r"\d{6}", c):
+        return c + ".SI"
+    return c
 
 
 def is_stock_code(code: str) -> bool:

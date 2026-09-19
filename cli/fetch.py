@@ -1,87 +1,45 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fetch.py —— 把行情拉进来（fetch market / backfill market / fetch board / fetch watch）。
+fetch.py —— 把行情拉进来。
 
-共同点：都是「联网 → 入库」，区别只在标的和粒度。
+    FetchMarket      一天的全市场日线（tushare，1 个请求），全系统的「交易日钟」
+    BackfillMarket   按交易日往前补历史全市场（tushare）
+    FetchBoard       板块聚合日线（**纯本地计算**，board_calc.BoardCalc）
+    Fetch            按命令行参数分派到上面三个
 
-    FetchMarket     一天的全市场日线（1 个请求），全系统的交易日钟
-    BackfillMarket  按交易日往前补历史，本地已有的跳过，可中断续跑
-    FetchBoards     一级 + 二级板块的当天快照（每个板块 1 个请求）
-    FetchWatch      只刷自选
-    Fetch           把上面几个按命令行参数分派出去
-
-BatchFetcher 是 FetchBoards / FetchWatch 共用的那段「逐个拉 + 间隔 + 计数」。
+板块行情不再联网：它从「全市场个股日线 + 成分股」本地算出来（见 datasource/board_calc.py）。
 """
 
 from __future__ import annotations
 
 import time
 
-from datasource.store import date_to_str
+from datasource.board_calc import BoardCalc
 
-from .base import Command, Context, Freshness, Target
-from .catalog import boards_at_level
-
-
-class BatchFetcher:
-    """把一批标的刷到最新：本地已是最新的跳过，其余带间隔逐个拉。"""
-
-    def __init__(self, ctx: Context):
-        self.ctx = ctx
-
-    def run(self, codes: list[str], days: int | None = None,
-            force: bool = False, label: str = "") -> int:
-        if not codes:
-            return 1
-
-        interval = self.ctx.interval
-        plan = Freshness(self.ctx.fetcher, force=force, days=days)
-        todo, fresh = plan.split(codes)
-
-        self.ctx.console.batch_header(label, len(codes), days)
-        self.ctx.console.batch_plan(label, todo, fresh, interval, plan.ref)
-        if not todo:
-            return 0
-
-        rc = 0
-        ok = 0
-        for i, code in enumerate(todo, 1):
-            if i > 1 and interval:
-                time.sleep(interval)          # 间隔一下，别把对方惹毛
-            try:
-                result = self.ctx.fetch_one(code, days=days)
-            except Exception as exc:
-                rc = 1
-                self.ctx.console.batch_step_failed(i, len(todo), code, exc)
-                continue
-            rec = result.fetched[-1]
-            parsed = Target.parse(code)
-            self.ctx.console.batch_step(i, len(todo), code, parsed.kind if parsed else "stock",
-                                        date_to_str(rec.get("trade_date")), len(result.added))
-            ok += 1
-
-        self.ctx.console.batch_done(ok, len(todo), len(fresh))
-        return rc if rc else (0 if ok == len(todo) else 1)
+from .base import Command, Context
 
 
 class FetchMarket(Command):
     """
-    fetch market —— 拉**一天**的全市场日线入库（1 个请求，约 5500 只）。
+    fetch market —— 拉**一天**的全市场日线入库（1 个请求）。
 
     这是整套架构的地基，同时是全系统的「交易日钟」：其余「本地是不是最新」都以它为准。
+    顺手把个股名字字典补上（daily 不返回名字，缺了才拉一次 stock_basic）。
     """
 
     name = "fetch market"
 
-    def __init__(self, ctx: Context, trade_date: str | None = None):
+    def __init__(self, ctx: Context, trade_date: str | None = None,
+                 force: bool = False):
         super().__init__(ctx)
         self.trade_date = trade_date
+        self.force = force
 
     def run(self) -> int:
         self.console.market_start()
         try:
-            r = self.ctx.fetcher.market(self.trade_date)
+            r = self.ctx.fetcher.market(self.trade_date, force=self.force)
         except Exception as exc:
             self.console.failed(exc)
             return 1
@@ -93,6 +51,13 @@ class FetchMarket(Command):
             return 1
         else:
             self.console.market_done(r.day, r.fetched, r.added, not self.trade_date)
+
+        # 个股名字字典：stock_daily 里有「stock_list 没有」的代码才拉一次，否则 0 请求
+        try:
+            self.ctx.fetcher.ensure_stock_names()
+        except Exception as exc:
+            self.console.failed(exc)
+            return 1
 
         self.console.db_state()
         self.console.day_health()
@@ -138,7 +103,7 @@ class BackfillMarket(Command):
         added_total = 0
         for i, p in enumerate(todo, 1):
             if i > 1 and interval:
-                time.sleep(interval)          # 间隔一下，别触发对方的频率限制
+                time.sleep(interval)          # 间隔一下，别触发 tushare 频率限制
             try:
                 r = self.ctx.fetcher.market(p["day"], force=self.force)
             except Exception as exc:
@@ -158,6 +123,11 @@ class BackfillMarket(Command):
             self.console.backfill_step(i, len(todo), p["day"], r.fetched, r.added, self.force)
 
         self.console.backfill_done(done, empty, failed, added_total)
+        # 补完历史顺手把个股名字字典补上（缺了才拉）
+        try:
+            self.ctx.fetcher.ensure_stock_names()
+        except Exception as exc:
+            self.console.failed(exc)
         self.console.db_state()
         self.console.day_health()
         if failed:
@@ -165,104 +135,45 @@ class BackfillMarket(Command):
         return 1 if failed else 0
 
 
-class FetchBoards(Command):
+class FetchBoard(Command):
     """
-    fetch board —— 一级和二级板块的行情一起更新（31 + 128 个，每个 1 个请求）。
+    fetch board —— 本地计算板块聚合日线（**0 个网络请求**）。
 
-    本地已经有当天的会跳过；level 可以只刷一层。
+    对 stock_daily 里每个交易日、board_daily 里还没有的，算一遍入库（幂等，可中断续跑）。
+    --force 先清空 board_daily 再全量重算。
     """
 
     name = "fetch board"
 
-    def __init__(self, ctx: Context, days: int | None = None,
-                 force: bool = False, level: int | None = None):
+    def __init__(self, ctx: Context, force: bool = False):
         super().__init__(ctx)
-        self.days = days
-        self.force = force
-        self.level = level
-
-    def run(self) -> int:
-        lv1 = boards_at_level(self.ctx.db, 1)
-        lv2 = boards_at_level(self.ctx.db, 2)
-        if not lv1 and not lv2:
-            self.console.need_tree()
-            return 1
-
-        if self.level == 2:
-            codes, what = lv2, f"二级 {len(lv2)}"
-        elif self.level == 1:
-            codes, what = lv1, f"一级 {len(lv1)}"
-        else:
-            # 一级在前，二级在后（报告看起来是分组的）
-            codes, what = lv1 + lv2, f"一级 {len(lv1)} + 二级 {len(lv2)}"
-        if not codes:
-            self.console.no_boards_at_level(self.level)
-            return 1
-
-        if self.days:
-            self.console.ignore_days()
-
-        rc = BatchFetcher(self.ctx).run(codes, days=self.days, force=self.force,
-                                        label=f"板块（{what}）")
-        if rc == 0:
-            self.console.board_state()
-        return rc
-
-
-class FetchWatch(Command):
-    """fetch watch —— 只刷自选里的标的。"""
-
-    name = "fetch watch"
-
-    def __init__(self, ctx: Context, days: int | None = None, force: bool = False):
-        super().__init__(ctx)
-        self.days = days
         self.force = force
 
     def run(self) -> int:
-        codes = self.ctx.watched()
-        if not codes:
-            self.console.no_watch()
+        self.console.board_calc_start(self.force)
+        try:
+            res = BoardCalc(db=self.ctx.db).compute(force=self.force)
+        except Exception as exc:
+            self.console.failed(exc)
             return 1
-        return BatchFetcher(self.ctx).run(codes, days=self.days, force=self.force,
-                                          label="自选 ")
+        self.console.board_calc_done(res)
+        self.console.board_state()
+        return 0
 
 
 class Fetch(Command):
-    """fetch <market|board|watch|代码…> —— 按顺序处理每个参数。"""
+    """fetch <market|board> —— 分派。"""
 
     name = "fetch"
 
-    def __init__(self, ctx: Context, codes: list[str], days: int | None = None,
-                 trade_date: str | None = None, force: bool = False,
-                 level: int | None = None):
+    def __init__(self, ctx: Context, what: str, date: str | None = None,
+                 force: bool = False):
         super().__init__(ctx)
-        self.codes = codes
-        self.days = days
-        self.trade_date = trade_date
+        self.what = what
+        self.date = date
         self.force = force
-        self.level = level
 
     def run(self) -> int:
-        rc = 0
-        for raw in self.codes:
-            rc |= self._one(raw)
-        return rc
-
-    def _one(self, raw: str) -> int:
-        code = raw.strip()
-        keyword = code.lower()
-        if keyword == "market":
-            return FetchMarket(self.ctx, self.trade_date).run()
-        if keyword == "board":
-            return FetchBoards(self.ctx, self.days, self.force, self.level).run()
-        if keyword == "watch":
-            return FetchWatch(self.ctx, self.days, self.force).run()
-
-        try:
-            result = self.ctx.fetch_one(code, days=self.days)
-        except Exception as exc:
-            self.console.err(f"\n❌ {code}：{exc}")
-            return 1
-        self.console.fetch_result(result)
-        return 0
+        if self.what == "market":
+            return FetchMarket(self.ctx, self.date, self.force).run()
+        return FetchBoard(self.ctx, self.force).run()

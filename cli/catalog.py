@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-catalog.py —— 本地「目录」类数据：板块层级表、个股名字字典。
+catalog.py —— 板块定义：层级表 + 成分股。
 
-    这几样东西都是**定义**，不是行情：板块属于哪一级、代码叫什么名字。
-    改一次能用很久，所以单独拿出来，和每天要刷的行情分开。
+    update board   拉最新申万一/二级板块 + 成分股（乐咕），更新数据库
+    drop board     删掉某个板块的本地数据
 
-顺带放着「有层级表之后才能做」的两件事：按层级取板块、按父级分组。
+顺带放着「有层级表之后才能做」的事：按父级分组（show board 用）。
 """
 
 from __future__ import annotations
 
+import time
+
 from datasource.base import is_board_code
-from datasource.board_tree import BoardTree, prune_dict, used_boards
+from datasource.board_tree import BoardTree
+from datasource.fetch_legu import LeguSource
 from datasource.store import today_int
 
 from .base import Command, Context
-
-
-def boards_at_level(db, level: int) -> list[str]:
-    """层级表里某一级的板块代码（一级 31 个 / 二级 128 个）。"""
-    return [r["concept"] for r in db.query(
-        "SELECT concept FROM board_tree WHERE level = ? ORDER BY concept", (level,))]
 
 
 def board_groups(db) -> list[tuple[str, list[str]]]:
@@ -35,87 +32,95 @@ def board_groups(db) -> list[tuple[str, list[str]]]:
             for r in rows if r["level"] == 1]
 
 
-def followed_boards(db, watched: list[str]) -> list[str]:
+class UpdateBoard(Command):
     """
-    「我在跟的板块」= 有行情的 ∪ 有成分股的 ∪ 自选里的。
+    update board —— 拉最新申万一/二级板块 + 成分股，更新数据库。
 
-    故意**不含** board_list 里纯粹是字典条目的板块 —— update tree 会把 159 个都写进字典，
-    要是都算成「在跟的」，update member all 一下就成了上百个请求。
-    """
-    rows = db.query("SELECT concept FROM board_daily "
-                    "UNION SELECT concept FROM concept_member ORDER BY concept")
-    codes = [r["concept"] for r in rows]
-    for c in watched:
-        if c not in codes:
-            codes.append(c)
-    return sorted(codes)
+    一次做三件事：
+        1. 拉乐咕层级 -> 整块重建 board_tree（快照，增/删/改都反映在这一次覆盖里）；
+        2. 逐个板块拉成分股 -> 整块替换 concept_member（顺带存市值权重）；
+        3. 清掉「这次树里没有」的旧板块（申万删掉的板块，连同它的行情/成员/字典一起删）。
 
-
-class UpdateStockList(Command):
-    """
-    update stock —— 同步个股字典（代码 → 名字），1 个请求拿全市场。
-
-    名字属于字典不属于行情：按只查要 5500 个请求，一次拉全量只要 1 个。
+    幂等：今天同步过的板块跳过（--force 才重拉），板块之间按 fetch_interval 间隔。
     """
 
-    name = "update stock"
+    name = "update board"
 
-    def run(self) -> int:
-        try:
-            src = self.ctx.tushare
-        except Exception as exc:
-            self.console.failed(exc)
-            return 1
-
-        self.console.stock_list_start()
-        try:
-            rows = src.fetch_stock_list()
-        except Exception as exc:
-            self.console.failed(exc)
-            return 1
-
-        now = today_int()
-        old = {r["code"]: r["name"] for r in self.ctx.db.load_stock_list()}
-        n = self.ctx.db.upsert_stock_list([{**r, "updated_at": now} for r in rows])
-
-        new = {r["code"]: r["name"] for r in rows}
-        added = sorted(set(new) - set(old))
-        renamed = sorted(c for c in set(new) & set(old)
-                         if new[c] and old[c] and new[c] != old[c])
-
-        self.console.stock_list_done(len(rows), n, len(old), added, renamed, new, old, now)
-        return 0
-
-
-class UpdateTree(Command):
-    """
-    update tree —— 重建一级/二级板块表，并清掉字典里不属于这两级的多余条目。
-
-    层级来自申万分类（东财接口不给层级），东财只用来拉板块字典。
-    """
-
-    name = "update tree"
+    def __init__(self, ctx: Context, force: bool = False):
+        super().__init__(ctx)
+        self.force = force
 
     def run(self) -> int:
         tree = BoardTree(db=self.ctx.db)
-        self.console.tree_start()
+        self.console.update_board_start()
         try:
             res = tree.build()
         except Exception as exc:
             self.console.failed(exc)
             return 1
-
         if not res.nodes:
-            self.console.err("❌ 一个节点都没建出来，先看看上面的报错")
+            self.console.err("❌ 一个板块都没建出来，先看看上面的报错")
             return 1
 
+        # 1) 层级表整块重建（快照）
         n = tree.save(res)
-        keep = {x.bk for x in res.nodes}
-        protected = used_boards(self.ctx.db) | set(self.ctx.watched("board"))
-        dropped = prune_dict(self.ctx.db, keep, protected)
-        kept = sorted(protected - keep)
-        self.console.tree_done(n, res.counts, dropped, kept)
-        return 0
+        # 名字也写进 board_list（字典），这样 show/自选能取到板块名
+        self.ctx.db.upsert_board_list([{"concept": x.code, "name": x.name}
+                                       for x in res.nodes])
+
+        # 2) 成分股
+        synced, failed, skipped = self._sync_members(res.nodes)
+
+        # 3) 删掉这次树里没有的旧板块
+        removed = self._prune_removed(res.nodes)
+
+        self.console.update_board_done(n, res.counts, synced, failed, skipped, removed)
+        self.console.member_state()
+        return 1 if failed else 0
+
+    # -- 成分股 -----------------------------------------------------------
+    def _sync_members(self, nodes) -> tuple[int, int, int]:
+        src = LeguSource()
+        now = today_int()
+        synced_at = {r["concept"]: r["member_updated_at"]
+                     for r in self.ctx.db.load_board_list()}
+        interval = self.ctx.legu_interval          # 乐咕限流严，用更慢的间隔
+
+        synced = failed = skipped = 0
+        total = len(nodes)
+        for i, node in enumerate(nodes, 1):
+            # 幂等：今天已同步的跳过（断点续跑 / 避免同一天重复拉）。
+            # 注意 member_updated_at 存的是「日期」—— 所以明天再跑 = 全部重新拉最新；
+            # 当天想强制全量重拉 = 加 --force。
+            if not self.force and synced_at.get(node.code) == now:
+                skipped += 1
+                self.console.member_skip(i, total, node.code, node.name)
+                continue
+            if i > 1 and interval:
+                time.sleep(interval)
+            try:
+                members = src.fetch_members(node.code)
+            except Exception as exc:
+                failed += 1
+                self.console.member_step_failed(i, total, node.code, exc)
+                continue
+            old = set(self.ctx.db.load_board_members(node.code))
+            new = {m["code"] for m in members}
+            self.ctx.db.replace_board_members(node.code, members, updated_at=now)
+            synced += 1
+            self.console.member_step(i, total, node.code, node.name,
+                                     len(members), len(new - old), len(old - new))
+        return synced, failed, skipped
+
+    # -- 删掉申万已经移除的板块 -------------------------------------------
+    def _prune_removed(self, nodes) -> list[str]:
+        keep = {x.code for x in nodes}
+        existing = {r["concept"] for r in self.ctx.db.query(
+            "SELECT DISTINCT concept FROM board_list")}
+        removed = sorted(existing - keep)
+        for c in removed:
+            self.ctx.db.drop_board(c)          # 行情 + 成员 + 字典一起删
+        return removed
 
 
 class DropBoard(Command):
@@ -142,13 +147,17 @@ class DropBoard(Command):
                 rc = 1
                 continue
 
-            before = self.ctx.boards.what_would_drop(code)
+            before = {
+                "board_daily": len(self.ctx.db.load_board_daily(code)),
+                "concept_member": len(self.ctx.db.load_board_members(code)),
+                "board_list": 1 if self.ctx.db.name_of("board", code) else 0,
+            }
             if not any(before.values()):
                 self.console.drop_nothing(code)
                 continue
 
             self.console.drop_report(code, before)
-            gone = self.ctx.boards.drop(code)
+            gone = self.ctx.db.drop_board(code)
             self.console.drop_done(code, gone, code in watched)
 
         if rc == 0 and self.codes:
