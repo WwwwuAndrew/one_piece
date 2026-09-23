@@ -12,6 +12,7 @@ import argparse
 
 from .base import Command, Context
 from .catalog import DropBoard, UpdateBoard
+from .debug import Debug
 from .fetch import BackfillMarket, Fetch
 from .show import Show
 from .watch import Unwatch, Watch
@@ -76,12 +77,21 @@ def build_parser() -> argparse.ArgumentParser:
                           help="今天同步过的板块也重新拉一遍")
 
     p_show = sub.add_parser(
-        "show", help="展示本地数据（成交额/涨跌幅柱状图 + 明细表，浏览器打开）")
+        "show", help="展示：show hot（热力图）/ watch / 具体代码")
     p_show.add_argument(
         "codes", nargs="+",
-        help="板块代码 801080.SI / 个股代码 300308 / 关键字 board（一级+二级，按一级分标签）"
-             " / watch（自选）")
+        help="hot board=二级板块热力图（默认）/ hot 801080.SI=该一级下的二级 / "
+             "watch（自选）/ 板块代码 / 个股代码")
     p_show.add_argument("--days", type=int, default=15, help="最近多少个交易日，默认 15")
+    p_show.add_argument("--level", type=int, default=2,
+                        help="配合 hot board：1=一级板块，2=二级板块（默认）")
+
+    p_debug = sub.add_parser(
+        "debug", help="调试查看因子（debug show <board|代码>）")
+    p_debug.add_argument("what", choices=["show"], help="show = 参与度 + 推进成本 一起看")
+    p_debug.add_argument(
+        "targets", nargs="+", metavar="target",
+        help="board=一级分标签表 / 板块代码 / 个股代码")
 
     return ap
 
@@ -100,7 +110,9 @@ def build_command(args, ctx: Context) -> Command:
         return Unwatch(ctx, args.codes)
     if args.cmd == "update":
         return UpdateBoard(ctx, force=args.force)
-    return Show(ctx, args.codes, days=args.days)
+    if args.cmd == "debug":
+        return Debug(ctx, args.what, args.targets)
+    return Show(ctx, args.codes, days=args.days, level=args.level)
 
 
 def main(argv: list[str] | None = None, ctx: Context | None = None) -> int:

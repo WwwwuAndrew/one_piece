@@ -163,7 +163,7 @@ def date_window(days: int) -> tuple[str, str]:
 #    板块成交额动辄几千亿 -> 用亿
 #    个股成交额可能只有几千万 -> 用万（够 1 亿时自动换成亿）
 #
-# 换算只该发生在**展示**那一步（fmt_amount / show_data），绝不要在读写路径上做。
+# 换算只该发生在**展示**那一步（fmt_amount / ui/show_data），绝不要在读写路径上做。
 
 AMOUNT_UNIT = {"board": "亿", "stock": "万"}    # 各自「默认」显示成什么单位
 YI = 1e8                                        # 亿

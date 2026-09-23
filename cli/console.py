@@ -26,6 +26,21 @@ def fmt_eta(n: int, interval: float) -> str:
     return f"{sec:.0f} 秒" if sec < 90 else f"{sec / 60:.1f} 分钟"
 
 
+def _fmt_ratio(v) -> str:
+    """因子比值（AbsFlow / RelFlow 这类），拿不到就是 —。"""
+    return "—" if v is None else f"{v:.3f}"
+
+
+def _fmt_cost(v) -> str:
+    """推进成本这类无量纲数值，拿不到就是 —。"""
+    return "—" if v is None else f"{v:.2f}"
+
+
+def _fmt_pct(v) -> str:
+    """把小数（0.0915）显示成带符号的百分比（+9.15%）。"""
+    return "—" if v is None else f"{v * 100:+.2f}%"
+
+
 class Console:
     """输出的唯一出口。"""
 
@@ -288,3 +303,37 @@ class Console:
     def show_grouped_plan(self, groups: list[tuple[str, list[str]]]) -> None:
         n2 = sum(len(k) for _, k in groups)
         self.say(f"一级 {len(groups)} 个标签，每个下面排它自己的二级（共 {n2} 个）")
+
+    # -- debug（因子） -----------------------------------------------------
+    def debug_no_data(self, code: str) -> None:
+        self.say(f"⚠️  {code} 本地还没有数据（先跑：python3 hunter.py fetch market / fetch board）")
+
+    def board_series(self, prows: list[dict], crows: list[dict] | None) -> None:
+        """单个标的最近 N 天的「参与度 + 推进成本」合并序列（debug show <代码>）。"""
+        if not prows:
+            return
+        r0 = prows[0]
+        kind_cn = "板块" if r0["kind"] == "board" else "个股"
+        cmap = {r["date"]: r for r in (crows or [])}
+        line = "=" * 74
+        self.say(f"\n{line}")
+        self.say(f"  {r0['code']}  {r0['name'] or '—'}   [{kind_cn}]")
+        self.say(f"  最近 {len(prows)} 个交易日（AbsPart=成交额÷MA20，RelPart=相对同级；"
+                 f"AbsCost=换手÷|涨幅|，RelCost=AbsCost÷前20日中位）")
+        self.say(line)
+        from tabulate import tabulate
+        table = []
+        for p in prows:
+            c = cmap.get(p["date"]) or {}
+            table.append([
+                date_to_str(p["date"]) or "",
+                _fmt_ratio(p["abs_part"]),
+                _fmt_ratio(p["rel_part"]),
+                _fmt_pct(p["chg"]),
+                _fmt_cost(c.get("abs_cost")),
+                _fmt_cost(c.get("rel_cost")),
+            ])
+        self.say(tabulate(table, headers=["日期", "AbsPart", "RelPart", "涨幅",
+                                          "AbsCost", "RelCost"],
+                          tablefmt="simple", stralign="right", disable_numparse=True))
+        self.say(line)
