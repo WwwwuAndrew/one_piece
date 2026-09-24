@@ -6,7 +6,8 @@ factor/cost.py —— Cost · 推进成本：推高/砸低价格要吃掉多少�
 口径见 doc/model.md §3.2：
 
     AbsCost = 当日换手率 ÷ |当日涨跌幅|
-    RelCost = AbsCost ÷ Median(过去 20 日 AbsCost，不含当天)
+    板块 RelCost = AbsCost ÷ Median(过去 20 日 AbsCost，不含当天)    —— 相对自身历史
+    个股 RelCost = AbsCost ÷ Median(同板块其余个股当日 AbsCost)       —— 相对同伴
 
 它本身不带方向（用 |涨跌幅|），方向由 participation 的「chg」单独看。
 只读本地数据库（board_daily / stock_daily / concept_member），不联网。
@@ -67,15 +68,61 @@ class Cost:
                             cap=self._board_cap(concept), days=days)
 
     def compute_stock(self, code, days=DAYS) -> list[dict] | None:
-        """算一只个股最近 days 天的推进成本；没数据返回 None。"""
+        """算一只个股最近 days 天的推进成本；没数据返回 None。
+
+        个股的 RelCost = AbsCost ÷ 同板块其余个股当日 AbsCost 的中位数（横向比同伴，
+        不是比自身历史）。
+        """
         code = str(code).strip().zfill(6)
-        rows = self.db.load_stock_daily(codes=[code])[-(days + RELBASE):]
-        if not rows:
+        own = self.db.load_stock_daily(codes=[code])[-days:]
+        if not own:
             return None
-        return self._series(code=code,
-                            name=self.db.name_of("stock", code) or "",
-                            kind="stock", rows=rows,
-                            cap=self._stock_cap(code), days=days)
+        cap = self._stock_cap(code)
+        if not cap:
+            return None
+
+        # 该股所属的二级板块 + 其余成员
+        board = None
+        for b in self.db.boards_of(code):
+            if self.db.board_level(b) == 2:
+                board = b
+                break
+        members = self.db.load_board_members_weighted(board) if board else []
+        cap_map = {m["code"]: m["mktcap"] for m in members if m.get("mktcap")}
+        peer_codes = [m["code"] for m in members if m["code"] != code]
+
+        # 同伴每日 AbsCost（换手率 ÷ |涨跌幅|）
+        peer_abs: dict[int, list[float]] = {}
+        if peer_codes:
+            peer_rows = self.db.load_stock_daily(
+                codes=peer_codes, start=own[0]["trade_date"], end=own[-1]["trade_date"])
+            for r in peer_rows:
+                pc = r.get("pct_chg")
+                pcap = cap_map.get(r["code"])
+                if pc is None or pc == 0 or not pcap:
+                    continue
+                peer_abs.setdefault(r["trade_date"], []).append(
+                    (r.get("amount") or 0.0) / pcap / (abs(pc) / 100.0))
+
+        out = []
+        for r in own:
+            chg = r.get("pct_chg")
+            abs_cost = None
+            if chg is not None and chg != 0:
+                abs_cost = (r.get("amount") or 0.0) / cap / (abs(chg) / 100.0)
+            med = _median(peer_abs.get(r["trade_date"], []))
+            rel = (abs_cost / med) if (abs_cost is not None and med) else None
+            out.append({"date": r["trade_date"], "abs_cost": abs_cost, "rel_cost": rel})
+
+        result = []
+        for s in out:
+            result.append({
+                "code": code, "name": self.db.name_of("stock", code) or "",
+                "kind": "stock", "date": s["date"],
+                "abs_cost": round(s["abs_cost"], 4) if s["abs_cost"] is not None else None,
+                "rel_cost": round(s["rel_cost"], 4) if s["rel_cost"] is not None else None,
+            })
+        return result or None
 
     # -- 核心 -------------------------------------------------------------
     def _series(self, *, code, name, kind, rows, cap, days) -> list[dict] | None:

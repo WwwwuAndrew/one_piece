@@ -337,3 +337,56 @@ class Console:
                                           "AbsCost", "RelCost"],
                           tablefmt="simple", stralign="right", disable_numparse=True))
         self.say(line)
+
+    def stock_series(self, prows: list[dict], crows: list[dict] | None,
+                     rrows: list[dict] | None) -> None:
+        """单个个股最近 N 天的 6 个因子序列（debug show <个股代码>）。"""
+        if not prows:
+            return
+        r0 = prows[0]
+        cmap = {r["date"]: r for r in (crows or [])}
+        rmap = {r["date"]: r for r in (rrows or [])}
+        line = "=" * 74
+        self.say(f"\n{line}")
+        self.say(f"  {r0['code']}  {r0['name'] or '—'}   [个股]")
+        self.say(f"  最近 {len(prows)} 个交易日（AbsPart=成交额÷MA20，RelPart=相对同级；"
+                 f"RS=相对板块强度=个股涨跌幅−板块涨跌幅，RS偏离=RS−Median20(RS)，正=跑赢加强；"
+                 f"AbsCost=换手÷|涨幅|，RelCost=比同板块同伴）")
+        self.say(line)
+        from tabulate import tabulate
+        table = []
+        for p in prows:
+            c = cmap.get(p["date"]) or {}
+            rs = rmap.get(p["date"]) or {}
+            table.append([
+                date_to_str(p["date"]) or "",
+                _fmt_ratio(p["abs_part"]),
+                _fmt_ratio(p["rel_part"]),
+                _fmt_pct(rs.get("rs")),
+                _fmt_pct(rs.get("rs_dev")),
+                _fmt_cost(c.get("abs_cost")),
+                _fmt_cost(c.get("rel_cost")),
+            ])
+        self.say(tabulate(table, headers=["日期", "AbsPart", "RelPart", "RS", "RS偏离",
+                                          "AbsCost", "RelCost"],
+                          tablefmt="simple", stralign="right", disable_numparse=True))
+        self.say(line)
+
+    def stock_cross(self, rows: list[dict]) -> None:
+        """一个板块内所有个股的最新一天 6 因子（debug show stock <板块代码>）。"""
+        if not rows:
+            return
+        line = "=" * 74
+        self.say(f"\n{line}")
+        self.say(f"  板块内个股 {len(rows)} 只 · 最新一天（按 RS 从高到低排）")
+        self.say(line)
+        from tabulate import tabulate
+        table = [[r["code"], (r["name"] or "")[:6],
+                  _fmt_ratio(r["abs_part"]), _fmt_ratio(r["rel_part"]),
+                  _fmt_pct(r["rs"]), _fmt_pct(r["rs_dev"]),
+                  _fmt_cost(r["abs_cost"]), _fmt_cost(r["rel_cost"])]
+                 for r in rows]
+        self.say(tabulate(table, headers=["代码", "名称", "AbsPart", "RelPart", "RS",
+                                          "RS偏离", "AbsCost", "RelCost"],
+                          tablefmt="simple", stralign="right", disable_numparse=True))
+        self.say(line)

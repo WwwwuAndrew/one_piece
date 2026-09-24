@@ -185,9 +185,10 @@ def _detail_html(b) -> str:
     def tbl(rows):
         trs = []
         for r in rows:
+            d = date_to_str(r['date'])
             trs.append(
-                "<tr>"
-                f"<td>{date_to_str(r['date'])}</td>"
+                f'<tr data-date="{d}" onclick="hlDate(\'{d}\')">'
+                f"<td>{d}</td>"
                 f"<td>{span_ratio(r['abs_part'], 3)}</td>"
                 f"<td>{span_ratio(r['rel_part'], 3)}</td>"
                 f"<td>{span_pct(r['chg'])}</td>"
@@ -231,6 +232,8 @@ _HOT_CSS = """
 .hot-right th, .hot-right td { padding: 4px 7px; text-align: right; border-bottom: 1px solid #eef1f5; }
 .hot-right th:first-child, .hot-right td:first-child { text-align: left; }
 .hot-right th { background: #f4f6fa; color: #5a6270; }
+.hot-right tbody tr { cursor: pointer; }
+.hot-right tr.d-row-on td { background: #fff3cd; }
 #tooltip { display: none; position: absolute; z-index: 20; background: rgba(30,34,44,.94); color: #fff;
            font-size: 12px; line-height: 1.6; padding: 7px 10px; border-radius: 7px; pointer-events: none;
            max-width: 260px; }
@@ -238,6 +241,7 @@ _HOT_CSS = """
 
 _HOT_JS = """
 var cur = null;
+var curDate = null;
 function onPoint(evt, el){
   var t = document.getElementById('tooltip');
   t.innerHTML = el.getAttribute('data-tip');
@@ -246,6 +250,12 @@ function onPoint(evt, el){
   t.style.top = (evt.pageY + 16) + 'px';
 }
 function offPoint(){ document.getElementById('tooltip').style.display = 'none'; }
+function hlDate(date){
+  if (curDate === date) { curDate = null; } else { curDate = date; }
+  document.querySelectorAll('.hot-right tr[data-date]').forEach(function(e){
+    e.classList.toggle('d-row-on', e.getAttribute('data-date') === curDate);
+  });
+}
 function pick(code){
   var cells = document.querySelectorAll('.heat rect[data-board]');
   if (cur === code) { cur = null; } else { cur = code; }
@@ -253,6 +263,10 @@ function pick(code){
     var on = e.getAttribute('data-board') === cur;
     e.classList.toggle('dimmed', cur !== null && !on);
     e.classList.toggle('active', on);
+  });
+  curDate = null;
+  document.querySelectorAll('.hot-right tr[data-date]').forEach(function(e){
+    e.classList.remove('d-row-on');
   });
   var d = document.getElementById('detail');
   if (cur && DETAIL[cur]) { d.innerHTML = DETAIL[cur]; }
