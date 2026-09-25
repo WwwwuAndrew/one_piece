@@ -12,7 +12,6 @@ import argparse
 
 from .base import Command, Context
 from .catalog import DropBoard, UpdateBoard
-from .debug import Debug
 from .fetch import BackfillMarket, Fetch
 from .show import Show
 from .watch import Unwatch, Watch
@@ -28,7 +27,8 @@ def build_parser() -> argparse.ArgumentParser:
                "  python3 hunter.py update board                # 首次/成分变动：拉申万板块定义\n"
                "  python3 hunter.py fetch market                 # 每天收盘：全市场日线\n"
                "  python3 hunter.py fetch board                  # 每天收盘：本地算板块指标\n"
-               "  python3 hunter.py show board                   # 一级分标签看行情\n"
+               "  python3 hunter.py show board                   # 全部二级板块的因子表\n"
+               "  python3 hunter.py show board --code 801081.SI  # 板块内个股的因子表\n"
                "  python3 hunter.py watch 801080.SI              # 加自选\n",
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -77,21 +77,18 @@ def build_parser() -> argparse.ArgumentParser:
                           help="今天同步过的板块也重新拉一遍")
 
     p_show = sub.add_parser(
-        "show", help="展示：show hot（热力图）/ watch / 具体代码")
+        "show", help="展示板块因子表：show board [--code 板块代码] [--good]")
     p_show.add_argument(
-        "codes", nargs="+",
-        help="hot board=二级板块热力图（默认）/ hot 801080.SI=该一级下的二级 / "
-             "watch（自选）/ 板块代码 / 个股代码")
-    p_show.add_argument("--days", type=int, default=15, help="最近多少个交易日，默认 15")
-    p_show.add_argument("--level", type=int, default=2,
-                        help="配合 hot board：1=一级板块，2=二级板块（默认）")
-
-    p_debug = sub.add_parser(
-        "debug", help="调试查看因子（debug show <board|代码>）")
-    p_debug.add_argument("what", choices=["show"], help="show = 参与度 + 推进成本 一起看")
-    p_debug.add_argument(
-        "targets", nargs="+", metavar="target",
-        help="board=一级分标签表 / 板块代码 / 个股代码")
+        "what", help="board —— 因子数字表（每板块 4 行 / 每只个股 3 行）")
+    p_show.add_argument("rest", nargs="*", help=argparse.SUPPRESS)
+    p_show.add_argument(
+        "--code", default=None, metavar="板块代码",
+        help="看这个板块内所有个股（右侧固定这个板块的表格），如 801081.SI")
+    p_show.add_argument(
+        "--good", action="store_true",
+        help="只留还在跑的：近 3 日累计涨跌幅 < 0（个股看近 3 日累积 RS < -1%%）、"
+             "或 AbsCost 连续 3 天下跌且 < 1 的，都不展示")
+    p_show.add_argument("--days", type=int, default=10, help="最近多少个交易日，默认 10")
 
     return ap
 
@@ -110,9 +107,7 @@ def build_command(args, ctx: Context) -> Command:
         return Unwatch(ctx, args.codes)
     if args.cmd == "update":
         return UpdateBoard(ctx, force=args.force)
-    if args.cmd == "debug":
-        return Debug(ctx, args.what, args.targets)
-    return Show(ctx, args.codes, days=args.days, level=args.level)
+    return Show(ctx, args.what, args.rest, code=args.code, good=args.good, days=args.days)
 
 
 def main(argv: list[str] | None = None, ctx: Context | None = None) -> int:

@@ -96,17 +96,48 @@ python3 hunter.py <动作> <内容> [选项]
 | **watch** | `watch 801080.SI 300308` | 加入自选（板块/个股都行） | ❌ |
 | | `watch` | 看当前自选 | ❌ |
 | **unwatch** | `unwatch 801080.SI` | 移出自选 | ❌ |
-| **show** | `show hot board` | 热力图：全部二级板块（默认） | ❌ 只读本地 |
-| | `show hot board --level 1` | 热力图：全部一级板块 | ❌ |
-| | `show hot 801080.SI` | 热力图：该一级板块下的二级板块（明细带一级数据） | ❌ |
-| | `show watch` | 只看自选 | ❌ |
-| | `show 801080.SI` | 某个板块 / 个股（`--days N` 最近 N 天） | ❌ |
-| **debug** | `debug show board` | 一级分标签看「参与度 + 推进成本」表（浏览器） | ❌ 只读本地 |
-| | `debug show stock 801081.SI` | 该板块内所有个股最新一天 6 因子（按 RS 降序） | ❌ |
-| | `debug show 801080.SI` | 看某个板块的参与度 + 成本（控制台） | ❌ |
-| | `debug show 300308` | 看某只个股的 6 因子（控制台） | ❌ |
+| **show** | `show board` | 因子数字表：全部二级板块（每板块 4 行：参与度/涨跌幅/成本/涨跌家数） | ❌ 只读本地 |
+| | `show board --good` | 同上，只留还在跑的（筛选口径见下） | ❌ |
+| | `show board --code 801081.SI` | 该板块内所有个股（每只 3 行：参与度/RS/成本），右侧固定该板块 | ❌ |
+| | `show board --code 801081.SI --good` | 同上，只留还在跑的 | ❌ |
 
 `show` 只读本地数据库，**不联网**；页面落在 `data/view.html`，可以反复看。
+
+### `show board` 怎么读
+
+**一个板块 4 行、一只个股 3 行，列是交易日（默认最近 10 天，`--days N` 可改）**，全是数字，按因子的特点上色
+（涨 / 高 = 红，跌 / 低 = 绿；比值类以 1 为界）：
+
+| | 行 | 怎么上色 |
+| --- | --- | --- |
+| **板块** | `AbsPart/RelPart` | `>1` 红（钱在来）、`<1` 绿 |
+| | `涨跌幅` | 正红、负绿 |
+| | `AbsCost/RelCost` | `>1` 红（更费劲）、`<1` 绿 |
+| | `涨跌家数` | 涨红 / 跌绿 / 平灰（`涨/跌/平`） |
+| **个股** | `AbsPart/RelPart` | 同上 |
+| | `RS/RS偏移` | 正红（跑赢 / 跑赢在加强）、负绿 |
+| | `AbsCost/RelCost` | 同上 |
+
+交互：
+
+- 点某个标的的某一天 → 这一列（该标的的几行）高亮；
+- 板块视图右侧换成这个二级板块的**一级母板块**，并高亮**同一天**那一行
+  （二级数据左边已经有了，不再重复展示）；
+- 个股视图右侧固定显示所在板块，点某天同样高亮板块表里那一天的**行**；
+- 右侧明细表**一行一天、不带日期列**：日期看左边那几列，行按同一批交易日、同样升序排，
+  位置一一对应；想确认是哪天，悬浮那一行有提示；
+- 悬浮任意格子看这一天的全部因子（全精度）；
+- 排序：板块按最近一天涨跌幅递减；个股按最近一天 RS（`0,1,2,3,4 → -1,-2,-3,-4`）。
+
+### `--good` 筛选口径（两条是**或**的关系）
+
+| | 不展示 |
+| --- | --- |
+| **板块** | 近 3 日累计涨跌幅 < 0 ／ AbsCost 连续 3 天下跌且最新一天 < 1 |
+| **个股** | 近 3 日累积 RS < -1% ／ AbsCost 连续 3 天下跌且最新一天 < 1 |
+
+「近 3 日」= 表格最后 3 列；累计涨跌幅用复利 `∏(1+pct)−1`，RS 是百分点差值所以直接相加。
+这几天缺数（停牌等）判定不了，**不否掉**。规则在 `factor/screen.py`。
 
 ---
 
@@ -115,7 +146,7 @@ python3 hunter.py <动作> <内容> [选项]
 ```bash
 python3 hunter.py update board      # 拉申万一级 31 + 二级 131 + 成分股（乐咕）
 python3 hunter.py fetch board       # 本地算这 162 个板块的指标
-python3 hunter.py show hot board        # 二级板块热力图（--level 1 转一级）
+python3 hunter.py show board        # 二级板块的因子数字表（点开右侧看它的一级）
 ```
 
 层级直接来自申万分类，**只到二级**（三级有 335 个、粒度太细）。
@@ -141,7 +172,7 @@ python3 hunter.py watch                       # 看当前自选
 python3 hunter.py unwatch 801080.SI           # 移出自选（势能结束了）
 ```
 
-`watch` / `unwatch` 只改本地状态，**一个请求都不发**。自选是 `show watch` 的索引，
+`watch` / `unwatch` 只改本地状态，**一个请求都不发**。自选只是一份清单，
 不存在「fetch watch」—— 行情永远是 `fetch market`（全市场）和 `fetch board`（全板块）整体更新。
 
 自选存在 `data/local.sqlite`（**不可重建**，单独一个文件，方便单独备份）。
@@ -177,7 +208,7 @@ data/
 | **B · Feature** | `stock_features_daily` · `board_features_daily` | 算出来的因子 |
 | **C · Signal** | `board_stage_daily` · `stock_score_daily` | 最终信号 |
 
-**单位约定**：A 层一律存**原始单位**（金额 = 元、成交量 = 股），换算成「亿 / 万」只发生在展示那一步。
+**单位约定**：A 层一律存**原始单位**（金额 = 元、成交量 = 股）；要换算成「亿 / 万」是展示层自己的事。
 **名字单独放字典表**：名字很少变、行情天天变，混在一起会让每天几千行重复存同样的名字。
 
 ---
@@ -229,7 +260,7 @@ data/
 
 | | 状态 |
 | --- | --- |
-| ✅ **已实现** | 全市场个股日线 · 板块聚合日线 · 个股字典 · 板块字典/层级/成分股 · 自选 · Participation · 推进成本（debug 观察） |
+| ✅ **已实现** | 全市场个股日线 · 板块聚合日线 · 个股字典 · 板块字典/层级/成分股 · 自选 · Participation · 推进成本 · RS（`show board` 数字表） |
 | 🔜 **下一步** | ① 个股状态向量 → 聚合板块 Breadth ② Crowding ③ Stage 判断 |
 
 后续：板块 risk 指标 · 势能的类型 · 需要跨年回测时补 `concept_member_history`（行情不用重采）。
@@ -257,11 +288,12 @@ legu_interval: 10.0      # 乐咕请求间隔（限流严，约 6 个/分钟）
 │   ├── fetch.py               fetch market / backfill market / fetch board
 │   ├── catalog.py             update board / drop board
 │   ├── watch.py               自选
-│   ├── show.py                show
-│   └── debug.py               debug <因子>（临时看因子数字）
-├── factor/                    因子层（Participation / Cost，后续 Crowding）
+│   └── show.py                show board（因子数字表）
+├── factor/                    因子层（Participation / Cost / RS / screen）
 │   ├── participation.py       Participation · 资金参与度（AbsPart + RelPart）
-│   └── cost.py                Cost · 推进成本（AbsCost / RelCost）
+│   ├── cost.py                Cost · 推进成本（AbsCost / RelCost）
+│   ├── rs.py                  RS · 相对板块强度（RS + RS 偏移）
+│   └── screen.py              show board --good 的筛选规则
 ├── config/
 │   ├── config.py              读 yaml 的 Config 单例
 │   └── system.yaml            token / 请求间隔
@@ -273,10 +305,8 @@ legu_interval: 10.0      # 乐咕请求间隔（限流严，约 6 个/分钟）
 │   ├── board_tree.py          板块层级模型
 │   ├── store.py               数据库存取层
 │   └── base.py                数据源基类 + 工具函数
-├── ui/                         展示层（把数据渲染成页面 / 表格）
-│   ├── show_data.py           行情展示（图形化页面 / 控制台表格）
-│   ├── board_view.py          参与度 + 成本的 debug 页面（复用 show_data 的 CSS/JS）
-│   └── chart_view.py          板块热力图（每板块 3 行：参与度/涨跌幅/成本）
+├── ui/                         展示层
+│   └── factor_table.py        因子数字表（show board / show board --code）
 ├── doc/model.md               ★ 模型本身（交易逻辑，与实现无关）
 └── data/                      数据（见上）
 ```

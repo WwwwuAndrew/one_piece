@@ -26,21 +26,6 @@ def fmt_eta(n: int, interval: float) -> str:
     return f"{sec:.0f} 秒" if sec < 90 else f"{sec / 60:.1f} 分钟"
 
 
-def _fmt_ratio(v) -> str:
-    """因子比值（AbsFlow / RelFlow 这类），拿不到就是 —。"""
-    return "—" if v is None else f"{v:.3f}"
-
-
-def _fmt_cost(v) -> str:
-    """推进成本这类无量纲数值，拿不到就是 —。"""
-    return "—" if v is None else f"{v:.2f}"
-
-
-def _fmt_pct(v) -> str:
-    """把小数（0.0915）显示成带符号的百分比（+9.15%）。"""
-    return "—" if v is None else f"{v * 100:+.2f}%"
-
-
 class Console:
     """输出的唯一出口。"""
 
@@ -199,7 +184,7 @@ class Console:
         if failed:
             self.say("   ⚠️ 有失败：重跑同一命令会接着补（已同步的今天会跳过；明天再跑则全部重拉最新）")
         self.say(f"\n   fetch board 现在会本地计算这 {n} 个板块的指标")
-        self.say("   show board 会按一级分标签，每个一级下面依次列出它的二级")
+        self.say("   show board 会把这些板块的因子排成数字表（二级板块每 4 行一个）")
 
     def member_step(self, i: int, n: int, code: str, name: str, count: int,
                     added: int, removed: int) -> None:
@@ -236,11 +221,7 @@ class Console:
         self.say(f"· 本来就不在自选：{self.label(code, kind)}")
 
     def watch_hint(self) -> None:
-        self.say("   （只改了本地状态，没联网。要看数据：python3 hunter.py show watch）")
-
-    def no_watch(self, boards_only: bool = False) -> None:
-        what = "自选里没有板块" if boards_only else "自选是空的"
-        self.say(f"⚠️  {what}。先加一个：python3 hunter.py watch 801080.SI")
+        self.say("   （只改了本地状态，没联网。看板块因子：python3 hunter.py show board）")
 
     def watchlist_empty(self) -> None:
         self.say("自选是空的。看到感兴趣的加进来：")
@@ -262,8 +243,9 @@ class Console:
                 note = f"   {w['note']}" if w["note"] else ""
                 self.say(f"    {w['code']}  {name:<8}  {date_to_str(w['watched_at'])} 起"
                          f"   {mark}{note}")
-        self.say("\n  看数据：python3 hunter.py show watch")
-        self.say("  移出：  python3 hunter.py unwatch <代码>")
+        self.say("\n  看板块因子：  python3 hunter.py show board")
+        self.say("  看板块内个股：python3 hunter.py show board --code <板块代码>")
+        self.say("  移出：        python3 hunter.py unwatch <代码>")
 
     # -- 删板块 -------------------------------------------------------------
     def bad_board_code(self, text: str, blank_line: bool = False) -> None:
@@ -287,106 +269,39 @@ class Console:
                      f"python3 hunter.py unwatch {code}")
         self.say(f"  拿回来：python3 hunter.py update board + python3 hunter.py fetch board")
 
-    # -- 展示 ---------------------------------------------------------------
+    # -- 展示（show board）-------------------------------------------------
     def need_tree_for_show(self) -> None:
         """show board 发现还没有层级表。"""
         self.say("⚠️  还没有一级/二级板块表。先跑一次：")
         self.say("      python3 hunter.py update board")
 
-    def show_watch_all(self, codes: list[str]) -> None:
-        self.say(f"自选 {len(codes)} 个，全部展示：" + ", ".join(codes))
+    def show_only_board(self, raw: str) -> None:
+        """show 现在只认 board（热力图 show hot / show <代码> 已废弃）。"""
+        self.err(f"❌ show 只认 board，收到：{raw.strip()}")
+        self.err("   （show hot / show <代码> 已废弃）现在只有这两个用法：")
+        self.err("      python3 hunter.py show board                    # 全部二级板块")
+        self.err("      python3 hunter.py show board --code 801081.SI   # 板块内所有个股")
 
-    def show_unknown(self, raw: str) -> None:
-        self.err(f"❌ 认不出的写法：{raw}（板块形如 801080.SI，个股形如 300308，"
-                 f"或关键字 board / watch）")
+    def show_no_board(self, code: str) -> None:
+        """板块表里没这个板块（代码写错，或者还没跑过 update board）。"""
+        self.say(f"⚠️  板块表里没有 {code}（先跑一次：python3 hunter.py update board）")
 
-    def show_grouped_plan(self, groups: list[tuple[str, list[str]]]) -> None:
-        n2 = sum(len(k) for _, k in groups)
-        self.say(f"一级 {len(groups)} 个标签，每个下面排它自己的二级（共 {n2} 个）")
+    def show_no_members(self, code: str) -> None:
+        self.say(f"⚠️  {self.label(code, 'board')} 本地没有成分股名单（先跑："
+                 f"python3 hunter.py update board）")
 
-    # -- debug（因子） -----------------------------------------------------
-    def debug_no_data(self, code: str) -> None:
-        self.say(f"⚠️  {code} 本地还没有数据（先跑：python3 hunter.py fetch market / fetch board）")
-
-    def board_series(self, prows: list[dict], crows: list[dict] | None) -> None:
-        """单个标的最近 N 天的「参与度 + 推进成本」合并序列（debug show <代码>）。"""
-        if not prows:
-            return
-        r0 = prows[0]
-        kind_cn = "板块" if r0["kind"] == "board" else "个股"
-        cmap = {r["date"]: r for r in (crows or [])}
-        line = "=" * 74
-        self.say(f"\n{line}")
-        self.say(f"  {r0['code']}  {r0['name'] or '—'}   [{kind_cn}]")
-        self.say(f"  最近 {len(prows)} 个交易日（AbsPart=成交额÷MA20，RelPart=相对同级；"
-                 f"AbsCost=换手÷|涨幅|，RelCost=AbsCost÷前20日中位）")
-        self.say(line)
-        from tabulate import tabulate
-        table = []
-        for p in prows:
-            c = cmap.get(p["date"]) or {}
-            table.append([
-                date_to_str(p["date"]) or "",
-                _fmt_ratio(p["abs_part"]),
-                _fmt_ratio(p["rel_part"]),
-                _fmt_pct(p["chg"]),
-                _fmt_cost(c.get("abs_cost")),
-                _fmt_cost(c.get("rel_cost")),
-            ])
-        self.say(tabulate(table, headers=["日期", "AbsPart", "RelPart", "涨幅",
-                                          "AbsCost", "RelCost"],
-                          tablefmt="simple", stralign="right", disable_numparse=True))
-        self.say(line)
-
-    def stock_series(self, prows: list[dict], crows: list[dict] | None,
-                     rrows: list[dict] | None) -> None:
-        """单个个股最近 N 天的 6 个因子序列（debug show <个股代码>）。"""
-        if not prows:
-            return
-        r0 = prows[0]
-        cmap = {r["date"]: r for r in (crows or [])}
-        rmap = {r["date"]: r for r in (rrows or [])}
-        line = "=" * 74
-        self.say(f"\n{line}")
-        self.say(f"  {r0['code']}  {r0['name'] or '—'}   [个股]")
-        self.say(f"  最近 {len(prows)} 个交易日（AbsPart=成交额÷MA20，RelPart=相对同级；"
-                 f"RS=相对板块强度=个股涨跌幅−板块涨跌幅，RS偏离=RS−Median20(RS)，正=跑赢加强；"
-                 f"AbsCost=换手÷|涨幅|，RelCost=比同板块同伴）")
-        self.say(line)
-        from tabulate import tabulate
-        table = []
-        for p in prows:
-            c = cmap.get(p["date"]) or {}
-            rs = rmap.get(p["date"]) or {}
-            table.append([
-                date_to_str(p["date"]) or "",
-                _fmt_ratio(p["abs_part"]),
-                _fmt_ratio(p["rel_part"]),
-                _fmt_pct(rs.get("rs")),
-                _fmt_pct(rs.get("rs_dev")),
-                _fmt_cost(c.get("abs_cost")),
-                _fmt_cost(c.get("rel_cost")),
-            ])
-        self.say(tabulate(table, headers=["日期", "AbsPart", "RelPart", "RS", "RS偏离",
-                                          "AbsCost", "RelCost"],
-                          tablefmt="simple", stralign="right", disable_numparse=True))
-        self.say(line)
-
-    def stock_cross(self, rows: list[dict]) -> None:
-        """一个板块内所有个股的最新一天 6 因子（debug show stock <板块代码>）。"""
-        if not rows:
-            return
-        line = "=" * 74
-        self.say(f"\n{line}")
-        self.say(f"  板块内个股 {len(rows)} 只 · 最新一天（按 RS 从高到低排）")
-        self.say(line)
-        from tabulate import tabulate
-        table = [[r["code"], (r["name"] or "")[:6],
-                  _fmt_ratio(r["abs_part"]), _fmt_ratio(r["rel_part"]),
-                  _fmt_pct(r["rs"]), _fmt_pct(r["rs_dev"]),
-                  _fmt_cost(r["abs_cost"]), _fmt_cost(r["rel_cost"])]
-                 for r in rows]
-        self.say(tabulate(table, headers=["代码", "名称", "AbsPart", "RelPart", "RS",
-                                          "RS偏离", "AbsCost", "RelCost"],
-                          tablefmt="simple", stralign="right", disable_numparse=True))
-        self.say(line)
+    def show_report(self, stats: dict, what: str) -> None:
+        """show 跑完之后的报告：展示了多少、筛掉多少、缺多少。"""
+        total, kept = stats["total"], stats["kept"]
+        if stats.get("opened"):
+            self.say(f"📋 {what} {kept} 个 · {stats['span']}")
+        if not total:
+            self.say(f"⚠️  {what} 本地一个都没有数据（先跑：python3 hunter.py fetch board）")
+        elif not kept:
+            self.say(f"🔎 --good 之后一个都没剩下（{total} → 0）")
+        elif kept < total:
+            self.say(f"🔎 --good：{total} → {kept}（筛掉 {total - kept} 个）")
+        if stats["missing"]:
+            self.say(f"⚠️  {len(stats['missing'])} 个标的本地没数据，已跳过")
+            if len(stats["missing"]) <= 8:
+                self.say("      " + ", ".join(stats["missing"]))

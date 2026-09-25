@@ -5,8 +5,6 @@ catalog.py —— 板块定义：层级表 + 成分股。
 
     update board   拉最新申万一/二级板块 + 成分股（乐咕），更新数据库
     drop board     删掉某个板块的本地数据
-
-顺带放着「有层级表之后才能做」的事：按父级分组（show board 用）。
 """
 
 from __future__ import annotations
@@ -19,17 +17,6 @@ from datasource.fetch_legu import LeguSource
 from datasource.store import today_int
 
 from .base import Command, Context
-
-
-def board_groups(db) -> list[tuple[str, list[str]]]:
-    """[(一级代码, [二级代码…]), …] —— 从层级表来。"""
-    rows = db.load_board_tree()
-    kids: dict[str, list[str]] = {}
-    for r in rows:
-        if r["parent"]:
-            kids.setdefault(r["parent"], []).append(r["concept"])
-    return [(r["concept"], sorted(kids.get(r["concept"], [])))
-            for r in rows if r["level"] == 1]
 
 
 class UpdateBoard(Command):

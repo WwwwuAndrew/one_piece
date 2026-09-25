@@ -6,8 +6,7 @@ fetch.py —— 数据获取主接口：tushare 全市场行情 + 本地读写�
     f = Fetcher()
     f.market("20260915")         -> MarketDay   全市场某一天（1 个请求）
     f.market_plan(30)            -> list[dict]  最近 30 个交易日的补数计划
-    f.history("801080.SI", 15)   -> list[dict]  读本地板块（不联网）
-    f.history("300308", 15)      -> list[dict]  读本地个股（不联网）
+    f.load("801080.SI")          -> list[dict]  读本地记录（板块/个股，不联网）
     f.dict_name("board", code)   -> str|None    名字（从字典表）
     f.ensure_stock_names()       -> int         补个股名字字典（缺了才拉，1 请求）
 
@@ -97,11 +96,6 @@ class Fetcher:
         for r in rows:
             r["name"] = name
         return rows
-
-    def history(self, code: str, days: int | None = None) -> list[dict]:
-        """本地已存的记录（升序）；days 非空则只取最近 N 个交易日。"""
-        rows = self.load(code)
-        return rows[-days:] if days else rows
 
     def dict_name(self, kind: str, code: str) -> str | None:
         """从字典表取名字（板块 board_list / 个股 stock_list）。"""

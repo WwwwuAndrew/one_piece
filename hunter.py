@@ -10,11 +10,9 @@ hunter.py —— 整个项目唯一的执行入口。
     cli/console.py   所有给人看的输出
     cli/fetch.py     拉行情（fetch / backfill）
     cli/watch.py     自选
-    cli/members.py   板块成分股名单
-    cli/catalog.py   板块层级表、个股名字字典、删板块
-    cli/show.py      展示
-    cli/debug.py     因子 debug（临时看数字，最终展示定了再替换）
-    factor/          因子层（Participation / Cost / Crowding …）
+    cli/catalog.py   板块层级表、成分股、删板块
+    cli/show.py      展示（板块 / 个股的因子数字表）
+    factor/          因子层（Participation / Cost / RS / screen）
 """
 
 from __future__ import annotations

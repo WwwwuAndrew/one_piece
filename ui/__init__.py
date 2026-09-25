@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ui/ —— 展示层：把数据渲染成给人看的页面 / 表格。
+ui/ —— 展示层：把因子渲染成给人看的页面。
 
-    show_data.py   行情展示（成交额/涨跌幅柱状图 + 明细表，show 命令走这里）
-    board_view.py  参与度 + 成本的 debug 页面（复用 show_data 的 CSS/JS）
+    factor_table.py  因子数字表（板块 4 行 / 个股 3 行，每格一个数字 + 红绿字），
+                     show board / show board --code 走这里，页面落在 data/view.html
 """
