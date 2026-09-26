@@ -259,60 +259,86 @@ table { border-collapse: separate; border-spacing: 0; }
 """
 
 _JS = """
-var DETAIL = %(detail)s, PARENT_OF = %(parent_of)s;
-var BOX0 = document.getElementById('detail').innerHTML;
-var cur = null, curDate = null;
+/* 因子表前端：悬浮提示 + 点选高亮 + 右侧联动。
+   命令行生成的静态页和 app 用的是**同一份**（app 直接从 /static/table.js 取），
+   所以两边行为永远一致，不会各写一套。 */
 
-/* 事件都挂在表上（委派），不给上万个格子里各写一份 onclick —— 页面小一半 */
-var GRID = document.getElementById('grid');
-function cellOf(evt){ return evt.target.closest ? evt.target.closest('td.cell') : null; }
-function showTip(evt, td){
+var FT = { cur: null, curDate: null, detail: null, parentOf: null, box: null, box0: '',
+           names: {}, mode: 'boards' };
+
+function ftCell(evt){ return evt.target.closest ? evt.target.closest('td.cell') : null; }
+function ftShowTip(evt, td){
   var t = document.getElementById('tooltip');
   t.textContent = td.getAttribute('data-tip');
   t.style.display = 'block';
-  moveTip(evt);
+  ftMoveTip(evt);
 }
-function moveTip(evt){
+function ftMoveTip(evt){
   var t = document.getElementById('tooltip');
   if (t.style.display !== 'block') { return; }
   t.style.left = Math.min(evt.clientX + 16, window.innerWidth - 300) + 'px';
   t.style.top = Math.min(evt.clientY + 14, window.innerHeight - 140) + 'px';
 }
-function hideTip(){ document.getElementById('tooltip').style.display = 'none'; }
-GRID.addEventListener('mouseover', function(e){
-  var td = cellOf(e); if (td && td.getAttribute('data-tip')) { showTip(e, td); }
-});
-GRID.addEventListener('mousemove', moveTip);
-GRID.addEventListener('mouseout', function(e){ if (cellOf(e)) { hideTip(); } });
-GRID.addEventListener('click', function(e){
-  var td = cellOf(e); if (td) { pick(td); }
-});
+function ftHideTip(){ document.getElementById('tooltip').style.display = 'none'; }
 
-function pick(el){
+/* 每次换表都要调一次（app 里表格内容会被替换）。
+   事件只往 #grid 上绑一次（委派），不给上万个格子各写一份 onclick。 */
+function initFactorTable(cfg){
+  var grid = document.getElementById('grid');
+  FT.detail = cfg.detail || null;
+  FT.parentOf = (cfg.parentOf === undefined) ? null : cfg.parentOf;
+  FT.names = cfg.names || {};
+  FT.mode = cfg.mode || 'boards';
+  FT.box = document.getElementById('detail');
+  FT.box0 = FT.box.innerHTML;
+  FT.cur = null; FT.curDate = null;
+  if (grid && grid.getAttribute('data-bound') !== '1') {
+    grid.setAttribute('data-bound', '1');
+    grid.addEventListener('mouseover', function(e){
+      var td = ftCell(e); if (td && td.getAttribute('data-tip')) { ftShowTip(e, td); }
+    });
+    grid.addEventListener('mousemove', ftMoveTip);
+    grid.addEventListener('mouseout', function(e){ if (ftCell(e)) { ftHideTip(); } });
+    grid.addEventListener('click', function(e){ var td = ftCell(e); if (td) { ftPick(td); } });
+  }
+  ftHideTip();
+}
+
+function ftPick(el){
   var b = el.getAttribute('data-b'), d = el.getAttribute('data-d');
-  if (cur === b && curDate === d) { cur = null; curDate = null; }
-  else { cur = b; curDate = d; }
+  if (FT.cur === b && FT.curDate === d) { FT.cur = null; FT.curDate = null; }
+  else { FT.cur = b; FT.curDate = d; }
 
   document.querySelectorAll('.grid tbody tr').forEach(function(tr){
-    tr.classList.toggle('on', cur !== null && tr.getAttribute('data-b') === cur);
+    tr.classList.toggle('on', FT.cur !== null && tr.getAttribute('data-b') === FT.cur);
   });
   document.querySelectorAll('.grid td.cell').forEach(function(td){
-    td.classList.toggle('sel', cur !== null && td.getAttribute('data-b') === cur
-                                && td.getAttribute('data-d') === curDate);
+    td.classList.toggle('sel', FT.cur !== null && td.getAttribute('data-b') === FT.cur
+                                && td.getAttribute('data-d') === FT.curDate);
   });
 
-  var box = document.getElementById('detail');
-  if (cur === null) { box.innerHTML = BOX0; return; }
-  if (PARENT_OF !== null) {                      /* 板块视图：右侧换成它的一级母板块 */
-    var p = PARENT_OF[cur];
-    box.innerHTML = (p && DETAIL[p]) ? DETAIL[p]
-                   : '<div class="hint">这个板块没有一级母板块</div>';
+  if (FT.cur === null) {
+    FT.box.innerHTML = FT.box0;
+  } else {
+    if (FT.parentOf !== null) {          /* 板块视图：右侧换成它的一级母板块 */
+      var p = FT.parentOf[FT.cur];
+      FT.box.innerHTML = (p && FT.detail[p]) ? FT.detail[p]
+                       : '<div class="hint">这个板块没有一级母板块</div>';
+    }
+    FT.box.querySelectorAll('tr[data-d]').forEach(function(tr){
+      tr.classList.toggle('on', tr.getAttribute('data-d') === FT.curDate);
+    });
   }
-  box.querySelectorAll('tr[data-d]').forEach(function(tr){
-    tr.classList.toggle('on', tr.getAttribute('data-d') === curDate);
-  });
+  /* app 的外壳用这个钩子显示「查看该板块个股」；命令行静态页没定义它，就是个空操作 */
+  if (typeof onFactorPick === 'function') {
+    onFactorPick(FT.cur, FT.curDate, FT.cur === null ? '' : (FT.names[FT.cur] || ''));
+  }
 }
 """
+
+# app 服务要按文件发出去，取个明确的名字（单份来源，见 _JS 的注释）
+TABLE_CSS = _CSS
+TABLE_JS = _JS
 
 
 def _tip(m: dict, r: dict, mode: str) -> str:
@@ -321,11 +347,14 @@ def _tip(m: dict, r: dict, mode: str) -> str:
     lines.append(f'AbsPart {_n(r.get("abs_part"), 3)} · RelPart {_n(r.get("rel_part"), 3)}')
     if mode == "boards":
         lines.append(f'涨跌幅 {_p(r.get("chg"))}')
-        lines.append(f'AbsCost {_n(r.get("abs_cost"))} · RelCost {_n(r.get("rel_cost"))}')
+        # 成本给全精度：规则②判定的是 AbsCost < 1，2 位小数会把 0.998 显示成 1.00
+        lines.append(f'AbsCost {_n(r.get("abs_cost"), 4)} · '
+                     f'RelCost {_n(r.get("rel_cost"), 4)}')
         lines.append(f'涨 {r.get("up")} / 跌 {r.get("down")} / 平 {r.get("flat")}')
     else:
         lines.append(f'RS {_p(r.get("rs"))} · RS偏移 {_p(r.get("rs_dev"))}')
-        lines.append(f'AbsCost {_n(r.get("abs_cost"))} · RelCost {_n(r.get("rel_cost"))}')
+        lines.append(f'AbsCost {_n(r.get("abs_cost"), 4)} · '
+                     f'RelCost {_n(r.get("rel_cost"), 4)}')
     return "\n".join(lines)
 
 
@@ -370,8 +399,8 @@ def _detail_columns(mode: str):
     else:
         cols += [("RS", lambda r: _pct(r.get("rs"))),
                  ("RS偏移", lambda r: _pct(r.get("rs_dev")))]
-    cols += [("AbsCost", lambda r: _ratio(r.get("abs_cost"))),
-             ("RelCost", lambda r: _ratio(r.get("rel_cost")))]
+    cols += [("AbsCost", lambda r: _ratio(r.get("abs_cost"), 3)),
+             ("RelCost", lambda r: _ratio(r.get("rel_cost"), 3))]
     if mode == "boards":
         cols += [("涨/跌/平", _breadth)]
     return cols
@@ -396,16 +425,18 @@ def _detail_table(m: dict, dates: list[int], mode: str) -> str:
             f'<table><thead>{head}</thead><tbody>{"".join(body)}</tbody></table>')
 
 
-def _page(title: str, legend: str, grid: str, right: str, detail: dict,
-          parent_of: dict | None) -> str:
-    js = _JS % {"detail": json.dumps(detail, ensure_ascii=False),
-                "parent_of": json.dumps(parent_of, ensure_ascii=False) if parent_of else "null"}
+def _page(v: dict) -> str:
+    """把一份「视图素材」（boards_fragment / stocks_fragment 的产物）拼成独立 HTML 页。"""
+    cfg = {"detail": v["detail"], "parentOf": v["parent_of"],
+           "names": v.get("names") or {}, "mode": v["mode"]}
+    js = (f"var FT_CFG = {json.dumps(cfg, ensure_ascii=False)};\n"
+          f"initFactorTable(FT_CFG);")
     return ('<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">'
-            f"<title>{title}</title><style>{_CSS}</style></head><body>"
-            f"<h1>{title}</h1>{legend}"
-            f'<div class="wrap"><div class="left" id="grid">{grid}</div>'
-            f'<div class="right" id="detail">{right}</div></div>'
-            f'<div id="tooltip"></div><script>{js}</script></body></html>')
+            f"<title>{v['title']}</title><style>{_CSS}</style></head><body>"
+            f"<h1>{v['title']}</h1>{v['legend']}"
+            f'<div class="wrap"><div class="left" id="grid">{v["grid"]}</div>'
+            f'<div class="right" id="detail">{v["right"]}</div></div>'
+            f'<div id="tooltip"></div><script>{_JS}\n{js}</script></body></html>')
 
 
 def _open(html_text: str) -> None:
@@ -419,15 +450,24 @@ def _span(dates: list[int]) -> str:
     return f"{date_to_str(dates[0])} ~ {date_to_str(dates[-1])}" if dates else "—"
 
 
+def _empty(reason: str, total: int, missing: list) -> dict:
+    return {"ok": False, "reason": reason, "grid": "", "detail": {}, "parent_of": None,
+            "names": {}, "mode": "boards", "title": "", "legend": "", "right": "",
+            "stats": {"total": total, "kept": 0, "missing": missing, "opened": False,
+                      "span": ""}}
+
+
 # ---------------------------------------------------------------------------
-# 对外：两个入口
+# 对外：视图素材（app 和命令行共用）
 # ---------------------------------------------------------------------------
 
-def gui_boards(part, cost, codes: list[str], parent_of: dict | None = None,
-               good: bool = False, days: int = DAYS) -> dict:
-    """show board [--good]：全部二级板块（每板块 4 行），右侧点开它的一级母板块。
+def boards_fragment(part, cost, codes: list[str], parent_of: dict | None = None,
+                    good: bool = False, days: int = DAYS) -> dict:
+    """show board [--good] 的**视图素材**：全部二级板块（每板块 4 行）+ 一级母板块明细表。
 
-    返回 {"total", "kept", "missing", "opened", "span"}，给命令层报告用。
+    返回的 dict 里就是渲染要用的东西（grid/legend/detail/names/stats…）；
+    命令行拿它拼成独立页面（`_page`），app 拿它填进自己的外壳 —— 渲染只有这一份。
+    没有可展示的数据时 `ok=False`，`reason` 说明原因。
     """
     db = part.db
     parent_of = parent_of or {}
@@ -447,6 +487,9 @@ def gui_boards(part, cost, codes: list[str], parent_of: dict | None = None,
                 parents[pcode] = _module(db, pcode, "board", prows, "一级")
 
     total = len(modules)
+    if not modules:
+        return _empty("本地还没有板块数据（先拉一次行情 + 计算板块）", total, missing)
+
     dates = _date_axis(modules, days)      # 横轴先定下来：排序和 --good 都按同一批交易日
     last = dates[-1] if dates else None
     modules.sort(key=lambda m: _chg_key(m, last), reverse=True)
@@ -454,19 +497,19 @@ def gui_boards(part, cost, codes: list[str], parent_of: dict | None = None,
         modules = [m for m in modules
                    if not screen.board_rejected(m["rows"], dates=dates)]
     if not modules:
-        return {"total": total, "kept": 0, "missing": missing, "opened": False,
-                "span": ""}
+        return _empty("--good 之后一个板块都没剩下", total, missing)
 
     detail = {c: _detail_table(m, dates, "boards") for c, m in parents.items()}
     legend = (
         '<div class="legend">'
         f'<b>{len(modules)} 个板块</b> · {_span(dates)}'
         + (f'（--good：{total} → {len(modules)}，已去掉「近 3 日累计涨跌幅 &lt; 0」'
-           f'或「AbsCost 连续 3 天下跌且 &lt; 1」的）' if good else "")
+           f'或「AbsPart 连续 3 天下跌且 &lt; 1」的）' if good else "")
         + '<br>每板块 4 行：<b>AbsPart/RelPart</b>（左=绝对、右=相对，&gt;1 红=钱在来）、'
           '<b>涨跌幅</b>（%）、<b>AbsCost/RelCost</b>（&gt;1 红=更费劲）、'
           '<b>涨跌家数</b>（涨/跌/平，涨红跌绿）。'
-          '排序 = 最近一天涨跌幅递减。<br>'
+          '排序 = 最近一天涨跌幅递减。'
+          '格子里的数字是 2 位小数（颜色按原值上色），悬浮看全精度。<br>'
           '点某板块某一天 → 这格高亮，右侧出它的一级母板块并高亮同一天；'
           '再点一次取消。右侧表不带日期列，行和左边的日期列一一对应。'
           '悬浮看这一天全部因子。</div>')
@@ -475,21 +518,27 @@ def gui_boards(part, cost, codes: list[str], parent_of: dict | None = None,
              '· 这格高亮、这个板块整组高亮<br>'
              '· 右边换成它的<b>一级母板块</b>（二级数据左边已经有了）<br>'
              '· 一级表里同一天那一行跟着高亮（一行一天，按左到右的顺序排，不带日期列）</div>')
-    _open(_page(f"板块因子 · 最近 {len(dates)} 个交易日", legend,
-                _grid(modules, dates, _ROWS_BOARD, "boards"), right, detail, parent_of))
-    return {"total": total, "kept": len(modules), "missing": missing, "opened": True,
-            "span": _span(dates)}
+    return {
+        "ok": True, "mode": "boards",
+        "title": f"板块因子 · 最近 {len(dates)} 个交易日",
+        "legend": legend, "right": right,
+        "grid": _grid(modules, dates, _ROWS_BOARD, "boards"),
+        "detail": detail, "parent_of": parent_of,
+        "names": {m["code"]: m["name"] for m in modules},
+        "stats": {"total": total, "kept": len(modules), "missing": missing,
+                  "opened": True, "span": _span(dates)},
+    }
 
 
-def gui_stocks(part, cost, rs, code: str, good: bool = False, days: int = DAYS) -> dict:
-    """show board --code 板块代码 [--good]：该板块内所有个股（每股 3 行），右侧固定该板块。
-
-    返回 {"total", "kept", "missing", "opened", "span"}，给命令层报告用。
-    """
+def stocks_fragment(part, cost, rs, code: str, good: bool = False,
+                    days: int = DAYS) -> dict:
+    """show board --code 板块代码 [--good] 的视图素材：板块内所有个股（每股 3 行）。"""
     db = part.db
     members = db.load_board_members(code)
-    modules, missing = [], []
+    if not members:
+        return _empty(f"{code} 本地没有成分股名单（先跑：update board）", 0, [])
 
+    modules, missing = [], []
     for mcode in members:
         rows = _stock_rows(part, cost, rs, mcode, days)
         if not rows:
@@ -498,6 +547,9 @@ def gui_stocks(part, cost, rs, code: str, good: bool = False, days: int = DAYS) 
         modules.append(_module(db, mcode, "stock", rows))
 
     total = len(modules)
+    if not modules:
+        return _empty(f"{code} 内的个股本地都还没有行情", total, missing)
+
     dates = _date_axis(modules, days)      # 横轴先定下来：排序和 --good 都按同一批交易日
     last = dates[-1] if dates else None
     modules.sort(key=lambda m: _rs_key(m, last))
@@ -505,8 +557,7 @@ def gui_stocks(part, cost, rs, code: str, good: bool = False, days: int = DAYS) 
         modules = [m for m in modules
                    if not screen.stock_rejected(m["rows"], dates=dates)]
     if not modules:
-        return {"total": total, "kept": 0, "missing": missing, "opened": False,
-                "span": ""}
+        return _empty("--good 之后一只都没剩下", total, missing)
 
     bname = db.name_of("board", code) or code
     btag = "二级" if db.board_level(code) == 2 else "一级"
@@ -514,7 +565,7 @@ def gui_stocks(part, cost, rs, code: str, good: bool = False, days: int = DAYS) 
         '<div class="legend">'
         f'<b>{bname} {code}</b> 内 {len(modules)} 只个股 · {_span(dates)}'
         + (f'（--good：{total} → {len(modules)}，已去掉「近 3 日累积 RS &lt; -1%」'
-           f'或「AbsCost 连续 3 天下跌且 &lt; 1」的）' if good else "")
+           f'或「AbsPart 连续 3 天下跌且 &lt; 1」的）' if good else "")
         + '<br>每只 3 行：<b>AbsPart/RelPart</b>（&gt;1 红=钱在来）、'
           '<b>RS/RS偏移</b>（%，正红=跑赢板块/跑赢在加强）、'
           '<b>AbsCost/RelCost</b>（&gt;1 红=更费劲）。<br>'
@@ -524,7 +575,41 @@ def gui_stocks(part, cost, rs, code: str, good: bool = False, days: int = DAYS) 
 
     right = _detail_table(_module(db, code, "board", _board_rows(part, cost, code, days) or [],
                                   btag), dates, "boards")
-    _open(_page(f"{bname} · 成分股因子 · 最近 {len(dates)} 个交易日", legend,
-                _grid(modules, dates, _ROWS_STOCK, "stocks"), right, {}, None))
-    return {"total": total, "kept": len(modules), "missing": missing, "opened": True,
-            "span": _span(dates)}
+    return {
+        "ok": True, "mode": "stocks",
+        "title": f"{bname} · 成分股因子 · 最近 {len(dates)} 个交易日",
+        "legend": legend, "right": right,
+        "grid": _grid(modules, dates, _ROWS_STOCK, "stocks"),
+        "detail": {}, "parent_of": None,
+        "names": {m["code"]: m["name"] for m in modules},
+        "board": {"code": code, "name": bname},
+        "stats": {"total": total, "kept": len(modules), "missing": missing,
+                  "opened": True, "span": _span(dates)},
+    }
+
+
+# ---------------------------------------------------------------------------
+# 命令行入口：素材 -> 独立页面 -> 打开浏览器
+# ---------------------------------------------------------------------------
+
+def gui_boards(part, cost, codes: list[str], parent_of: dict | None = None,
+               good: bool = False, days: int = DAYS) -> dict:
+    """show board [--good]：出页面。
+
+    返回 {"total", "kept", "missing", "opened", "span"}，给命令层报告用。
+    """
+    v = boards_fragment(part, cost, codes, parent_of, good=good, days=days)
+    if v["ok"]:
+        _open(_page(v))
+    return v["stats"]
+
+
+def gui_stocks(part, cost, rs, code: str, good: bool = False, days: int = DAYS) -> dict:
+    """show board --code 板块代码 [--good]：出页面。
+
+    返回 {"total", "kept", "missing", "opened", "span"}，给命令层报告用。
+    """
+    v = stocks_fragment(part, cost, rs, code, good=good, days=days)
+    if v["ok"]:
+        _open(_page(v))
+    return v["stats"]

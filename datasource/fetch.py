@@ -6,6 +6,7 @@ fetch.py —— 数据获取主接口：tushare 全市场行情 + 本地读写�
     f = Fetcher()
     f.market("20260915")         -> MarketDay   全市场某一天（1 个请求）
     f.market_plan(30)            -> list[dict]  最近 30 个交易日的补数计划
+    f.refresh_mktcap("20260915") -> dict        刷新成分股市值快照（1 个请求）
     f.load("801080.SI")          -> list[dict]  读本地记录（板块/个股，不联网）
     f.dict_name("board", code)   -> str|None    名字（从字典表）
     f.ensure_stock_names()       -> int         补个股名字字典（缺了才拉，1 请求）
@@ -156,6 +157,29 @@ class Fetcher:
         added = self.db.save_stock_daily(rows)
         return MarketDay(day=day, fetched=len(rows), added=added,
                          total=self.db.stock_day_counts().get(date_to_int(day), 0))
+
+    # -- 市值快照（板块市值加权的权重）-------------------------------------
+    def refresh_mktcap(self, day: str | None = None) -> dict:
+        """刷新成分股的**总市值快照**（1 个请求）。
+
+        返回 {"day", "fetched", "updated", "skipped"}；skipped=True 表示还没有成分股名单，
+        一个请求都没发。
+
+        板块涨跌幅 = Σ(pct_chg × 市值) / Σ市值，权重就是这张快照。乐咕只在 update board
+        时给一次市值，所以每天跟着 fetch market 刷一次，免得权重停在几周前。
+        只改 concept_member.mktcap，不动成员名单。
+
+        ⚠️ 与行情分开：行情拉失败要报错，**市值刷失败不该拖垮行情入库**（调用方自己决定），
+           而且 daily_basic 限速很严（实测 1 次/小时），一天一次正好。
+        """
+        # 还没有成分股名单（没跑过 update board）时不用去问 —— 别白烧掉那一小时一次的名额
+        if not self.db.query("SELECT 1 FROM concept_member LIMIT 1"):
+            return {"day": to_date(day), "fetched": 0, "updated": 0, "skipped": True}
+        src = self._market_source()
+        rows = src.fetch_mktcap(day)
+        updated = self.db.update_member_mktcap(rows)
+        return {"day": to_date(day), "fetched": len(rows), "updated": updated,
+                "skipped": False}
 
     def market_plan(self, days: int, end: str | None = None) -> list[dict]:
         """最近 days 个交易日的**补数计划**：[{"day", "rows"}, …]，新的在前。

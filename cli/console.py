@@ -98,7 +98,23 @@ class Console:
 
     # -- 全市场日线 ---------------------------------------------------------
     def market_start(self) -> None:
-        self.say("拉全市场日线（tushare，1 个请求）…")
+        self.say("拉全市场日线 + 市值快照（tushare，2 个请求）…")
+
+    def mktcap_done(self, r: dict) -> None:
+        """市值快照刷新结果（板块涨跌幅的权重）。"""
+        if r.get("skipped"):
+            self.say("⏭  还没有成分股名单，跳过市值刷新（先跑：python3 hunter.py update board）")
+            return
+        self.say(f"✅ 市值快照已刷新：{r['day']}  全市场 {r['fetched']:,} 只"
+                 f"，更新成分股 {r['updated']:,} 行")
+
+    def mktcap_failed(self, exc: Exception) -> None:
+        self.say(f"⚠️  市值快照没刷上（不影响行情入库）：{exc}")
+        self.say("      过一小时再跑一次 fetch market 即可；在那之前板块加权用的是上一次的快照。")
+
+    def names_failed(self, exc: Exception) -> None:
+        """个股名字字典没刷上（不影响行情入库，所以只是个警告）。"""
+        self.say(f"⚠️  个股名字字典没刷上（不影响行情入库）：{exc}")
 
     def market_skipped(self, day: str, total: int) -> None:
         self.say(f"⏭  {day} 本地已有 {total:,} 行，跳过（要重拉：backfill market "
@@ -162,9 +178,13 @@ class Console:
     def board_calc_done(self, res) -> None:
         if not res.days:
             self.say(f"⏭  板块日线已是最新（{res.skipped_days} 个交易日都有），不用算")
-            return
-        self.say(f"✅ 算了 {res.days} 个交易日 / {res.boards} 个板块，入库 {res.rows:,} 行"
-                 + (f"（另有 {res.skipped_days} 个交易日本地已有，跳过）" if res.skipped_days else ""))
+        else:
+            self.say(f"✅ 算了 {res.days} 个交易日 / {res.boards} 个板块，入库 {res.rows:,} 行"
+                     + (f"（另有 {res.skipped_days} 个交易日本地已有，跳过）"
+                        if res.skipped_days else ""))
+        if res.missing_caps:
+            self.say(f"   ℹ️  有 {res.missing_caps} 条成分股关系没有市值，"
+                     f"权重按「本板块成员市值的中位数」补（跑一次 fetch market 可以刷市值）")
 
     # -- 板块定义（update board，乐咕）-------------------------------------
     def update_board_start(self) -> None:

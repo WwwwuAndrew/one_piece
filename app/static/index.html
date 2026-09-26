@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>one_piece · 猎人系统</title>
+<link rel="stylesheet" href="/static/table.css">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">🏴 one_piece <span class="sub">猎人系统</span></div>
+  <nav>
+    <button class="nav" data-go="home">首页</button>
+    <button class="nav" data-go="boards">看板</button>
+  </nav>
+  <div class="status" id="status">读取中…</div>
+</header>
+
+<main id="view"></main>
+
+<div class="bottombar hidden" id="bottombar">
+  <span id="sel-text">已选中 —</span>
+  <button class="primary" id="btn-detail">查看该板块的个股 →</button>
+  <button class="ghost" id="btn-clear">取消选择</button>
+</div>
+
+<div class="modal-mask hidden" id="modal-mask">
+  <div class="modal">
+    <div class="modal-head">
+      <span id="modal-title">—</span>
+      <span class="spinner hidden" id="modal-spin"></span>
+      <button class="ghost" id="modal-close">关闭</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+    <pre class="log hidden" id="modal-log"></pre>
+  </div>
+</div>
+
+<div id="tooltip"></div>
+
+<script src="/static/table.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

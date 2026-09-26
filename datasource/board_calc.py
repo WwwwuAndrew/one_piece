@@ -21,8 +21,10 @@ board_calc.py —— 板块聚合日线：从「全市场个股日线 + 成分�
     flat        平盘家数 = #{ i | pct_chg_i = 0 }
     change_pct  涨跌幅   = Σ (pct_chg_i × w_i) / Σ w_i          （市值加权，单位：%）
 
-    权重 w_i = 成分股总市值 mktcap_i（来自乐咕成分股，存 concept_member.mktcap）。
-    某只股票缺市值时退化为等权（w_i = 1），保证仍能算出一个合理的加权均值。
+    权重 w_i = 成分股总市值 mktcap_i（concept_member.mktcap，单位元）。
+    这个市值是**快照**：update board 时由乐咕写入，之后每天 fetch market 用
+    tushare daily_basic 刷一次，所以它总是「最近同步那天」的市值。
+    某只成分股缺市值时，用**本板块有市值成员的中位数**补它的权重（见下面的 ⚠️）。
 
 举例（只讲 change_pct，其它都是直接求和/计数）：
     某板块某日 3 只成分股：
@@ -39,6 +41,10 @@ board_calc.py —— 板块聚合日线：从「全市场个股日线 + 成分�
 ⚠️ 边界：
     · 停牌 / 当天没行情的股票，tushare daily 里没有那行，直接跳过（不参与任何求和）。
     · 新股没有 pct_chg（无昨收）：只计它的成交额/成交量，不计涨跌家数和涨跌幅。
+    · **缺市值的股票，权重取「本板块有市值成员的中位数」** —— 不能像以前那样给 w=1：
+      别的成员是 1e10 量级，给 1 等于把这只票**整个踢出**加权平均（那不是「退化为等权」，
+      而是「当它不存在」，还会让剩余成员的权重悄悄变大）。本板块一个市值都没有时，
+      才真的退化成等权（所有 w 都相等）。
     · 板块当天一只成分股都没有成交 -> 不写 board_daily 那一行（避免「全 0」误导）。
 """
 
@@ -50,6 +56,15 @@ from dataclasses import dataclass
 from .store import store as default_store
 
 
+def _median(values) -> float | None:
+    values = sorted(v for v in values if v is not None)
+    if not values:
+        return None
+    n = len(values)
+    mid = n // 2
+    return values[mid] if n % 2 else (values[mid - 1] + values[mid]) / 2
+
+
 @dataclass
 class BoardResult:
     """一次 compute 的结果，方便上层报告。"""
@@ -58,6 +73,7 @@ class BoardResult:
     boards: int = 0          # 涉及几个板块（有成分股的）
     rows: int = 0            # 入库几行
     skipped_days: int = 0    # 本地已有、跳过的交易日数
+    missing_caps: int = 0    # 多少条成分股关系缺市值（权重按中位数补的）
 
 
 class BoardCalc:
@@ -91,8 +107,10 @@ class BoardCalc:
 
         members_by_concept = self._load_members()
         boards = len(members_by_concept)
+        missing = sum(1 for ms in members_by_concept.values()
+                      for _, cap in ms if not (cap and cap > 0))
 
-        result = BoardResult(boards=boards, skipped_days=skipped)
+        result = BoardResult(boards=boards, skipped_days=skipped, missing_caps=missing)
         for day in todo:
             rows = self._aggregate_day(day, members_by_concept)
             if rows:
@@ -146,6 +164,11 @@ class BoardCalc:
         w_sum = 0.0     # 权重和
         w_chg = 0.0     # 权重 × 涨跌幅 之和
 
+        # 缺市值的股票拿什么当权重：本板块**有市值成员的中位数**。
+        # 给 w=1 是错的 —— 别的成员是 1e10 量级，w=1 等于把这只票踢出去（还顺手放大了别人的权重）。
+        # 全班都没有市值时才落到 1.0，那时所有票同权，是真的等权。
+        fallback_w = _median([cap for _, cap in members if cap and cap > 0]) or 1.0
+
         for code, mktcap in members:
             row = day.get(code)
             if row is None:
@@ -165,8 +188,7 @@ class BoardCalc:
             else:
                 flat += 1
 
-            # 市值加权：缺市值退化为等权（w=1），保证仍能算均值
-            w = mktcap if (mktcap and mktcap > 0) else 1.0
+            w = mktcap if (mktcap and mktcap > 0) else fallback_w
             w_chg += chg * w
             w_sum += w
 

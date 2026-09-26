@@ -1,0 +1,86 @@
+/* app/static/app.css —— app 外壳的样式。
+   表格本体的样式在 table.css（那份来自 ui/factor_table.py，app 和命令行共用）。 */
+
+:root {
+  --bg: #eef1f5; --card: #fff; --line: #e2e6ec;
+  --ink: #1f2430; --muted: #7b8494; --brand: #2f6fed;
+}
+
+/* 覆盖 table.css 里给独立页面用的 body 留白（app 有顶栏，不能再来一层 20px） */
+body { padding: 0; }
+
+button { font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid #d5dae2;
+         background: #fff; color: #3a4150; padding: 7px 13px; }
+button:hover:not(:disabled) { border-color: var(--brand); color: var(--brand); }
+button.primary { background: var(--brand); border-color: var(--brand); color: #fff; }
+button.primary:hover:not(:disabled) { filter: brightness(1.07); color: #fff; }
+button.ghost { background: transparent; border-color: transparent; color: var(--muted); }
+button.ghost:hover:not(:disabled) { border-color: #d5dae2; color: var(--brand); }
+button.big { padding: 12px 16px; font-size: 14.5px; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+
+.top { display: flex; align-items: center; gap: 18px; padding: 10px 18px;
+       background: #fff; border-bottom: 1px solid var(--line);
+       position: sticky; top: 0; z-index: 20; }
+.brand { font-size: 16px; font-weight: 700; white-space: nowrap; }
+.brand .sub { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 4px; }
+.top nav { display: flex; gap: 8px; }
+.top nav button.active { background: var(--brand); border-color: var(--brand); color: #fff; }
+.status { margin-left: auto; color: var(--muted); font-size: 12.5px; text-align: right; }
+
+#view { padding: 14px 18px 84px; }
+
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; }
+.card h2 { font-size: 14px; margin: 0 0 10px; }
+.card p.muted { color: var(--muted); font-size: 12.5px; line-height: 1.75; margin: 0 0 12px; }
+.card button { display: block; width: 100%; margin-bottom: 8px; text-align: left; }
+.card button:last-child { margin-bottom: 0; }
+.kv { font-size: 13px; line-height: 2.05; color: #3a4150; }
+.kv b { color: var(--ink); font-variant-numeric: tabular-nums; }
+.kv .ok { color: #1a7f45; }
+.kv .warn { color: #d73027; }
+
+.toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+.toolbar .title { font-size: 15px; font-weight: 600; }
+.toolbar label { font-size: 13px; color: #3a4150; display: flex; align-items: center; gap: 5px; }
+.toolbar .note { color: var(--muted); font-size: 12.5px; margin-left: auto; }
+select { font: inherit; font-size: 13px; padding: 5px 8px; border-radius: 7px;
+         border: 1px solid #d5dae2; background: #fff; color: #3a4150; }
+input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--brand); }
+.switch { user-select: none; }
+
+.legend-box { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+              padding: 7px 12px; margin-bottom: 10px; }
+.legend-box summary { cursor: pointer; color: var(--brand); font-size: 13px; }
+.legend-box .legend { margin: 8px 0 2px; }
+
+/* 因子表容器高度：顶栏 + 工具条 + 图例 + 底部留白都扣掉，表自己滚 */
+.wrap .left, .wrap .right { max-height: calc(100vh - 258px); }
+
+.bottombar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 25;
+             display: flex; align-items: center; gap: 14px; padding: 10px 18px;
+             background: #fff; border-top: 1px solid var(--line);
+             box-shadow: 0 -2px 12px rgba(0, 0, 0, .06); }
+.bottombar .code { color: var(--muted); font-size: 12px; margin-left: 6px; }
+.bottombar .spacer { margin-left: auto; }
+
+.hidden { display: none !important; }
+.loading { padding: 40px; color: var(--muted); font-size: 13.5px; }
+
+.modal-mask { position: fixed; inset: 0; background: rgba(20, 24, 32, .45); z-index: 40;
+              display: flex; align-items: center; justify-content: center; padding: 24px; }
+.modal { background: #fff; border-radius: 12px; width: min(920px, 100%); max-height: 88vh;
+         display: flex; flex-direction: column; overflow: hidden; }
+.modal-head { display: flex; align-items: center; gap: 10px; padding: 14px 18px;
+              border-bottom: 1px solid var(--line); font-weight: 600; }
+.modal-head .spinner { width: 14px; height: 14px; border: 2px solid #dfe4ec; border-top-color: var(--brand);
+                       border-radius: 50%; animation: spin .9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.modal-body { padding: 12px 18px 4px; font-size: 13.5px; line-height: 1.85; color: #3a4150; }
+.modal-body .ok { color: #1a7f45; font-weight: 600; }
+.modal-body .bad { color: #d73027; font-weight: 600; }
+.modal-body .warn { color: #b26a00; font-weight: 600; }
+.log { margin: 10px 18px 18px; padding: 12px 14px; background: #1f2430; color: #d7dee9;
+       border-radius: 9px; font-size: 12px; line-height: 1.7; overflow: auto; max-height: 46vh;
+       white-space: pre-wrap; word-break: break-all; }

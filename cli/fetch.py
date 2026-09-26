@@ -22,10 +22,15 @@ from .base import Command, Context
 
 class FetchMarket(Command):
     """
-    fetch market —— 拉**一天**的全市场日线入库（1 个请求）。
+    fetch market —— 拉**一天**的全市场日线入库，顺手刷市值快照（2 个请求）。
 
     这是整套架构的地基，同时是全系统的「交易日钟」：其余「本地是不是最新」都以它为准。
-    顺手把个股名字字典补上（daily 不返回名字，缺了才拉一次 stock_basic）。
+    顺手做两件小事（都不影响主流程）：
+
+        1. 个股名字字典：daily 不返回名字，缺了才拉一次 stock_basic；
+        2. 市值快照（tushare daily_basic，1 个请求）：板块涨跌幅是市值加权，
+           权重不能停在几周前那次 update board 上 —— 每天刷一次。**失败了只警告**，
+           行情照常入库（daily_basic 限速很严，一天只该跑一次）。
     """
 
     name = "fetch market"
@@ -52,12 +57,20 @@ class FetchMarket(Command):
         else:
             self.console.market_done(r.day, r.fetched, r.added, not self.trade_date)
 
-        # 个股名字字典：stock_daily 里有「stock_list 没有」的代码才拉一次，否则 0 请求
+        # 个股名字字典：stock_daily 里有「stock_list 没有」的代码才拉一次，否则 0 请求。
+        # 它是「字典」不是「行情」：刷不上只警告 —— 否则会出现「行情明明入库了，
+        # 却因为名字没刷上而显示失败」这种误导（app 的弹框会把它放大）。
         try:
             self.ctx.fetcher.ensure_stock_names()
         except Exception as exc:
-            self.console.failed(exc)
-            return 1
+            self.console.names_failed(exc)
+
+        # 市值快照：板块市值加权的权重。失败**不算错**（行情已经入库了），只提示
+        if r.day:
+            try:
+                self.console.mktcap_done(self.ctx.fetcher.refresh_mktcap(r.day))
+            except Exception as exc:
+                self.console.mktcap_failed(exc)
 
         self.console.db_state()
         self.console.day_health()
@@ -123,11 +136,11 @@ class BackfillMarket(Command):
             self.console.backfill_step(i, len(todo), p["day"], r.fetched, r.added, self.force)
 
         self.console.backfill_done(done, empty, failed, added_total)
-        # 补完历史顺手把个股名字字典补上（缺了才拉）
+        # 补完历史顺手把个股名字字典补上（缺了才拉）；同样：刷不上只警告
         try:
             self.ctx.fetcher.ensure_stock_names()
         except Exception as exc:
-            self.console.failed(exc)
+            self.console.names_failed(exc)
         self.console.db_state()
         self.console.day_health()
         if failed:

@@ -4,6 +4,9 @@
 app.py —— 命令行长什么样，以及怎么变成命令对象。
 
 这里是**唯一**懂 argv 的地方：解析、分派、退出码。命令本身不知道命令行怎么拼。
+
+不带参数（`python3 hunter.py`）= 起本地 app（浏览器界面），那是给日常用的入口；
+命令行那一套还在，适合批量补历史、定时任务这类场景。
 """
 
 from __future__ import annotations
@@ -15,14 +18,16 @@ from .catalog import DropBoard, UpdateBoard
 from .fetch import BackfillMarket, Fetch
 from .show import Show
 from .watch import Unwatch, Watch
+from .webapp import RunApp
 
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="hunter.py",
-        description="去追寻资金的脚印吧",
+        description="去追寻资金的脚印吧（不带参数 = 起本地 app 界面）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="示例（完整用法见 README.md）：\n"
+               "  python3 hunter.py                              # ★ 起本地 app（浏览器界面）\n"
                "  python3 hunter.py backfill market --days 30   # 首次：补 30 天全市场\n"
                "  python3 hunter.py update board                # 首次/成分变动：拉申万板块定义\n"
                "  python3 hunter.py fetch market                 # 每天收盘：全市场日线\n"
@@ -31,7 +36,14 @@ def build_parser() -> argparse.ArgumentParser:
                "  python3 hunter.py show board --code 801081.SI  # 板块内个股的因子表\n"
                "  python3 hunter.py watch 801080.SI              # 加自选\n",
     )
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    # 不给子命令 = 起 app，所以这几个默认值要挂在主 parser 上
+    ap.set_defaults(port=8765, no_browser=False)
+    sub = ap.add_subparsers(dest="cmd")      # 不 required：不给就是 app
+
+    p_app = sub.add_parser(
+        "app", help="★ 起本地 app（浏览器界面）：首页拉数据、看板、点进板块看个股")
+    p_app.add_argument("--port", type=int, default=8765, help="监听端口，默认 8765")
+    p_app.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
 
     p_fetch = sub.add_parser(
         "fetch", help="拉取并入库（market=全市场 / board=本地计算板块）")
@@ -87,7 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_show.add_argument(
         "--good", action="store_true",
         help="只留还在跑的：近 3 日累计涨跌幅 < 0（个股看近 3 日累积 RS < -1%%）、"
-             "或 AbsCost 连续 3 天下跌且 < 1 的，都不展示")
+             "或 AbsPart 连续 3 天下跌且 < 1（钱在撤）的，都不展示")
     p_show.add_argument("--days", type=int, default=10, help="最近多少个交易日，默认 10")
 
     return ap
@@ -95,6 +107,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def build_command(args, ctx: Context) -> Command:
     """把解析出来的参数翻成一个命令对象。"""
+    if args.cmd in (None, "app"):        # 不给子命令 = 起 app
+        return RunApp(ctx, port=int(getattr(args, "port", 8765)),
+                      open_browser=not getattr(args, "no_browser", False))
     if args.cmd == "fetch":
         return Fetch(ctx, args.what, date=args.date, force=args.force)
     if args.cmd == "backfill":

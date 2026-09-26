@@ -120,6 +120,8 @@ CREATE INDEX IF NOT EXISTS idx_board_tree_parent ON board_tree(parent);
 
 -- 板块成员：快照式（只有「现在有哪些」，没有 start/end 日期）。
 -- mktcap 是总市值（元），用于板块涨跌幅的市值加权；拿不到就是 NULL。
+-- 这是**快照**：update board 时由乐咕写入，之后每天 fetch market 用 tushare daily_basic
+-- 刷一次（见 update_member_mktcap），所以它总是「最近同步那天」的市值。
 CREATE TABLE IF NOT EXISTS concept_member (
     concept TEXT NOT NULL,             -- 801080.SI
     code    TEXT NOT NULL,             -- 300308（无交易所后缀）
@@ -201,10 +203,13 @@ class SqliteDB:
     SCHEMA: str = ""
     TABLE_COLS: dict[str, tuple] = {}
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, check_same_thread: bool = True):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path))
+        # check_same_thread=False 只给「本地 app 的只读连接」用：
+        # 一个连接被多个请求线程共用，所以调用方必须自己用锁串起来（见 app/server.py）。
+        # 写库一律各线程自己的连接，不要跨线程共用。
+        self.conn = sqlite3.connect(str(self.path), check_same_thread=check_same_thread)
         self.conn.row_factory = sqlite3.Row
         # WAL：读写并发好、写入快；NORMAL 在 WAL 下是安全的，比 FULL 快很多
         self.conn.execute("PRAGMA journal_mode=WAL")
@@ -317,8 +322,10 @@ class Store(SqliteDB):
     SCHEMA = RAW_SCHEMA
     TABLE_COLS = RAW_TABLE_COLS
 
-    def __init__(self, path: str | Path | None = None):
-        super().__init__(path if path is not None else DEFAULT_RAW_DB)
+    def __init__(self, path: str | Path | None = None, *,
+                 check_same_thread: bool = True):
+        super().__init__(path if path is not None else DEFAULT_RAW_DB,
+                         check_same_thread=check_same_thread)
 
     # -- 写：全市场个股日线 -----------------------------------------------
     def save_stock_daily(self, rows: list[dict]) -> int:
@@ -396,6 +403,27 @@ class Store(SqliteDB):
                 "member_updated_at=excluded.member_updated_at",
                 (concept, date_to_int(updated_at) if updated_at else None))
         return len(members)
+
+    # -- 写：刷新成分股市值（快照，只改 mktcap 这一列）---------------------
+    def update_member_mktcap(self, rows: list[dict]) -> int:
+        """按代码刷新成分股的市值，返回改动的行数。
+
+        rows : [{"code": "300308", "mktcap": 123456789.0}, …]（总市值，元）
+
+        只 UPDATE concept_member.mktcap —— **不动成员名单**（名单是乐咕的事，
+        市值每天都会变，所以这两件事分开放：名单低频、市值高频）。
+        只在名单里的代码会被改到；名单外的代码是空操作。
+        """
+        if not rows:
+            return 0
+        pairs = [(r.get("mktcap"), str(r.get("code"))) for r in rows
+                 if r.get("code") and r.get("mktcap")]
+        if not pairs:
+            return 0
+        with self.conn:
+            cur = self.conn.executemany(
+                "UPDATE concept_member SET mktcap = ? WHERE code = ?", pairs)
+        return cur.rowcount
 
     # -- 读：个股日线 -----------------------------------------------------
     def stock_day_counts(self) -> dict[int, int]:
@@ -586,8 +614,10 @@ class LocalStore(SqliteDB):
     SCHEMA = LOCAL_SCHEMA
     TABLE_COLS = LOCAL_TABLE_COLS
 
-    def __init__(self, path: str | Path | None = None):
-        super().__init__(path if path is not None else DEFAULT_LOCAL_DB)
+    def __init__(self, path: str | Path | None = None, *,
+                 check_same_thread: bool = True):
+        super().__init__(path if path is not None else DEFAULT_LOCAL_DB,
+                         check_same_thread=check_same_thread)
 
     def watch(self, kind: str, code: str, name: str | None = None,
               note: str | None = None, at=None) -> None:
@@ -699,6 +729,14 @@ def _selftest() -> int:
         # 同步成员不该动字典里的名字
         assert raw.load_board_list()[0]["name"] == "电子"
         print("board_list + concept_member: 整块替换、市值权重、名字不被覆盖 ✅")
+
+        # 市值快照刷新：只改 mktcap，名单一个字都不动；名单外的代码是空操作
+        assert raw.update_member_mktcap([{"code": "300308", "mktcap": 5e10},
+                                         {"code": "999999", "mktcap": 1e10}]) == 1
+        after = {m["code"]: m["mktcap"] for m in raw.load_board_members_weighted("801080.SI")}
+        assert after == {"300308": 5e10, "600519": 3e10}
+        assert raw.load_board_members("801080.SI") == ["300308", "600519"]
+        print("concept_member: 市值快照刷新只改 mktcap、不动名单 ✅")
 
         bd = raw.save_board_daily([{"concept": "801080.SI", "trade_date": "2026-09-11",
                                     "change_pct": 1.25, "amount": 488620000000.0,

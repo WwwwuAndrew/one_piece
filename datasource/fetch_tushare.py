@@ -6,6 +6,7 @@ fetch_tushare.py —— tushare 数据源（全市场日线 + 个股字典 + 交
     src = TushareSource()                    # token 从 config/system.yaml 读
     day, rows = src.fetch_market_daily()     # ★ 全市场最近有数据的一天（1 个请求）
     rows = src.fetch_market_on("2026-09-15") # 严格只这一天，没有就 []
+    rows = src.fetch_mktcap("2026-09-15")    # 全市场总市值（1 个请求，板块加权用）
     rows = src.fetch_stock_list()            # 全市场名字（1 个请求）
     days = src.trade_days("2026-08-01", "2026-09-15")   # 交易日历
 
@@ -15,9 +16,10 @@ fetch_tushare.py —— tushare 数据源（全市场日线 + 个股字典 + 交
 ★ 关键：tushare 官方建议**循环日期取全市场，不要循环 ts_code**。
   单次上限 6000 条而全市场约 5500 只，所以**一天 1 个请求**。
 
-⚠️ 单位换算（tushare 用的是「手 / 千元」，入库前必须换成「股 / 元」）：
-      vol    手   -> 股   × 100
-      amount 千元 -> 元   × 1000
+⚠️ 单位换算（tushare 用的是「手 / 千元 / 万元」，入库前必须换成「股 / 元」）：
+      vol        手   -> 股   × 100
+      amount     千元 -> 元   × 1000
+      total_mv   万元 -> 元   × 1e4      （daily_basic，市值快照）
 ⚠️ `daily` 不返回名字（也不返回换手率/振幅/量比/市值，那些在 daily_basic）。
    名字用 fetch_stock_list() 一次拉全量，别按只查。
 """
@@ -161,6 +163,47 @@ class TushareSource(DataSource):
                 "volume": vol * 100 if vol is not None else None,
                 "amount": amount * 1000 if amount is not None else None,
             })
+        return out
+
+    # -- 市值快照（代码 → 总市值）-----------------------------------------
+    def fetch_mktcap(self, day) -> list[dict]:
+        """拉某一天的全市场**总市值**（1 个请求，约 5500 只）。
+
+        板块涨跌幅是市值加权，权重就是它 —— 所以每天刷一次（fetch market 顺手带上），
+        免得权重停留在「上次 update board 那天」慢慢失真。
+
+        返回 [{"code": "300308", "mktcap": 8.76e10}, …]，单位**元**。
+
+        ⚠️ 单位换算：daily_basic 的 total_mv 是**万元**，入库前 ×1e4 换成元。
+        ⚠️ 这个接口限速比 daily 严（实测 1 次/小时档），所以只做**一天一次**，
+           别拿去回补历史（回补几十天会一直撞限速）。
+        同一个请求里其实还带 circ_mv（流通市值），以后若要看「自由流通」口径可以一起取。
+        """
+        day = to_date(day)
+        ds = (day or "").replace("-", "")
+        if not ds:
+            raise ValueError(f"看不懂的日期：{day!r}")
+        try:
+            df = self.pro.daily_basic(trade_date=ds, fields="ts_code,total_mv")
+        except Exception as exc:
+            raise RuntimeError(
+                f"tushare daily_basic(trade_date={ds!r}) 调用失败："
+                f"{type(exc).__name__}: {exc}\n"
+                f"    · 若提示频率超限 -> 该接口限速很严（实测 1 次/小时），过一小时再跑；\n"
+                f"    · 若提示权限/积分不足 -> 是 token 或积分档位的问题。") from exc
+
+        if df is None or len(df) == 0:
+            return []
+        if "total_mv" not in df.columns:
+            raise RuntimeError(
+                f"tushare daily_basic 返回的字段和预期不一致：{list(df.columns)}")
+
+        out = []
+        for r in df.to_dict("records"):
+            code = str(r.get("ts_code") or "").split(".")[0]
+            mv = to_num(r.get("total_mv"))
+            if code and mv:
+                out.append({"code": code, "mktcap": mv * 1e4})     # 万元 -> 元
         return out
 
     # -- 个股字典（代码 → 名字）------------------------------------------

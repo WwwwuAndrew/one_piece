@@ -9,29 +9,38 @@ screen.py —— `show board --good` 的筛选：把「已经不成立」的标�
        板块：近 3 日累计涨跌幅 < 0      —— 方向已经不在了
        个股：近 3 日累积 RS < -1%       —— 相对板块已经跑输
 
-    ② AbsCost 连续 3 天下跌、且最新一天 < 1
-       —— 推进一天比一天省力、而且已经省到「几乎没有成本」：既没有抛压、也没有资金
-          在往上推。势能已经走完，不值得再盯。
+    ② AbsPart 连续 3 天下跌、且最新一天 < 1
+       —— 成交额一天比一天少、而且已经低于自己 20 日均量：**钱在撤**，这个板块不用看了。
+
+为什么第 ② 条看 **AbsPart 而不是 AbsCost**（这里踩过一次坑，改回来的原因）：
+
+    · AbsPart = 成交额 ÷ MA20(成交额)，是**自己跟自己比**，所以「<1 = 缩量」在不同板块
+      之间是**可比**的。
+    · AbsCost 的「<1」不可比：同一天 131 个二级板块从 0.05（油气开采Ⅱ）到 509（铁路公路），
+      银行 / 纺织这类低换手板块天然就在 1 以下（换手率本来就低）。
+    · 更要紧的是**方向反了**：成本下跌 = 推价格越来越省力 = 筹码变稳（model.md：
+      「涨幅 > 0 且 RelCost 低 → 轻松上涨，筹码稳，强」），拿它当坏事是反的。
+      成本低真正坏的那种情况是「涨幅 < 0 且成本低 = 轻松下跌（无人承接）」，
+      而那已经被第 ① 条覆盖了。
 
 口径：
 
-    · 「最近 3 天」= 表格里最后 3 列（默认 15 天窗口的尾巴）。调用方把窗口的交易日传进来
+    · 「最近 3 天」= 表格最后 3 列（默认 10 天窗口的尾巴）。调用方把窗口的交易日传进来
       （dates），这样所有标的都按**同一批交易日**判定；传 None 就退回用序列自己的最后 3 行。
     · 累计涨跌幅用**复利** `∏(1 + pct) − 1` —— 收益率类一律复利（见 README 的复权纪律）。
     · RS 是「百分点差值」不是收益率，3 日累积**直接相加**。
     · 数据不够（这几天里缺任何一天，比如停牌）时**不否掉** —— 宁可多展示一个，
       也不因为缺数把它藏起来。
-    · 只看 AbsCost（原始成本），不看 RelCost：这条规则问的是「绝对地费不费劲」。
 
 只读内存里的因子序列（factor 算好的行），不碰数据库。
 """
 
 from __future__ import annotations
 
-DAYS = 3            # 「最近几天」：连续下跌 / 累计涨幅都看这 3 天
+DAYS = 3            # 「最近几天」：参与度退潮 / 累计涨幅都看这 3 天
 CHG_FLOOR = 0.0     # 近 3 日累计涨跌幅 < 0 就否掉
 RS_FLOOR = -0.01    # 近 3 日累积 RS < -1% 就否掉
-COST_FLOOR = 1.0    # 最新一天 AbsCost < 1 才可能触发第 ② 条
+PART_FLOOR = 1.0    # 最新一天 AbsPart < 1（缩量到 20 日均量下方）才可能触发第 ② 条
 
 
 def _window(rows, days: int, dates=None) -> list[dict] | None:
@@ -80,24 +89,24 @@ def cum_rs(rows, days: int = DAYS, dates=None) -> float | None:
     return None if vals is None else sum(vals)
 
 
-def cost_easing(rows, days: int = DAYS, floor: float = COST_FLOOR, dates=None) -> bool:
-    """AbsCost 连续 days 天**严格下跌**、且最新一天 < floor —— 成本越来越省、已经省到没有。
+def part_fading(rows, days: int = DAYS, floor: float = PART_FLOOR, dates=None) -> bool:
+    """AbsPart 连续 days 天**严格下跌**、且最新一天 < floor —— 钱在撤（缩量到 20 日均量下方）。
 
-    任何一天缺 AbsCost（比如当天涨跌幅为 0，成本算不出来）都算判定不了，返回 False。
+    任何一天缺 AbsPart 都算判定不了，返回 False（宁可多展示，不因为缺数把它藏起来）。
     """
-    vals = _values(rows, "abs_cost", days, dates)
+    vals = _values(rows, "abs_part", days, dates)
     if vals is None or vals[-1] >= floor:
         return False
     return all(vals[i] < vals[i - 1] for i in range(1, len(vals)))
 
 
 def board_rejected(rows, days: int = DAYS, dates=None) -> bool:
-    """板块：近 3 日累计涨跌幅 < 0 **或** AbsCost 连续 3 天下跌且 < 1。"""
+    """板块：近 3 日累计涨跌幅 < 0 **或** AbsPart 连续 3 天下跌且 < 1。"""
     chg = cum_change(rows, days, dates)
-    return (chg is not None and chg < CHG_FLOOR) or cost_easing(rows, days, dates=dates)
+    return (chg is not None and chg < CHG_FLOOR) or part_fading(rows, days, dates=dates)
 
 
 def stock_rejected(rows, days: int = DAYS, dates=None) -> bool:
-    """个股：近 3 日累积 RS < -1% **或** AbsCost 连续 3 天下跌且 < 1。"""
+    """个股：近 3 日累积 RS < -1% **或** AbsPart 连续 3 天下跌且 < 1。"""
     rs = cum_rs(rows, days, dates)
-    return (rs is not None and rs < RS_FLOOR) or cost_easing(rows, days, dates=dates)
+    return (rs is not None and rs < RS_FLOOR) or part_fading(rows, days, dates=dates)
